@@ -240,6 +240,8 @@ export class SubagentsStatusComponent implements Component {
 		return lines;
 	}
 
+	invalidate(): void {}
+
 	dispose(): void {
 		clearInterval(this.refreshTimer);
 	}

@@ -163,7 +163,7 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 		assert.equal((sent[1] as { customType?: string; display?: boolean }).customType, SLASH_RESULT_TYPE);
 		assert.equal((sent[1] as { display?: boolean }).display, false);
 		assert.equal((sent[1] as { content?: string }).content, "Scout finished");
-		assert.deepEqual(log, ["send:visible", "status:running...", "send:hidden", "status:clear"]);
+		assert.deepEqual(log, ["send:visible", "status:running... | Ctrl+O live detail", "send:hidden", "status:clear"]);
 
 		const visibleDetails = resolveSlashMessageDetails!((sent[0] as { details?: unknown }).details);
 		assert.ok(visibleDetails);
@@ -217,7 +217,7 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 		assert.equal((sent[1] as { customType?: string; display?: boolean }).customType, SLASH_RESULT_TYPE);
 		assert.equal((sent[1] as { display?: boolean }).display, false);
 		assert.equal((sent[1] as { content?: string }).content, "Subagent failed");
-		assert.deepEqual(log, ["send:visible", "status:running...", "send:hidden", "status:clear"]);
+		assert.deepEqual(log, ["send:visible", "status:running... | Ctrl+O live detail", "send:hidden", "status:clear"]);
 
 		const visibleDetails = resolveSlashMessageDetails!((sent[0] as { details?: unknown }).details);
 		assert.ok(visibleDetails);

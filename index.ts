@@ -24,7 +24,7 @@ import { cleanupOldChainDirs } from "./settings.ts";
 import { renderWidget, renderSubagentResult } from "./render.ts";
 import { SubagentParams, StatusParams } from "./schemas.ts";
 import { findByPrefix, readStatus } from "./utils.ts";
-import { createSubagentExecutor } from "./subagent-executor.ts";
+import { createSubagentExecutor, type SubagentParamsLike } from "./subagent-executor.ts";
 import { createAsyncJobTracker } from "./async-job-tracker.ts";
 import { createResultWatcher } from "./result-watcher.ts";
 import { registerSlashCommands } from "./slash-commands.ts";
@@ -128,10 +128,16 @@ function createSlashResultComponent(
 ): Container {
 	const container = new Container();
 	let lastVersion = -1;
+	let lastExpanded = options.expanded;
 	container.render = (width: number): string[] => {
 		const snapshot = getSlashRenderableSnapshot(details);
-		if (snapshot.version !== lastVersion) {
+		if (
+			snapshot.version !== lastVersion
+			|| options.expanded !== lastExpanded
+			|| isSlashResultRunning(snapshot.result)
+		) {
 			lastVersion = snapshot.version;
+			lastExpanded = options.expanded;
 			rebuildSlashResultContainer(container, snapshot.result, options, theme);
 		}
 		return Container.prototype.render.call(container, width);
@@ -273,7 +279,7 @@ MANAGEMENT (use action field, omit agent/task/chain/tasks):
 		parameters: SubagentParams,
 
 		execute(id, params, signal, onUpdate, ctx) {
-			return executor.execute(id, params, signal, onUpdate, ctx);
+			return executor.execute(id, params as SubagentParamsLike, signal ?? new AbortController().signal, onUpdate, ctx);
 		},
 
 		renderCall(args, theme) {
@@ -366,7 +372,7 @@ MANAGEMENT (use action field, omit agent/task/chain/tasks):
 			}
 
 			if (asyncDir) {
-				let status;
+				let status: ReturnType<typeof readStatus>;
 				try {
 					status = readStatus(asyncDir);
 				} catch (error) {

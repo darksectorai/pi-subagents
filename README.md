@@ -1113,6 +1113,13 @@ Files per task:
 - `{runId}_{agent}.jsonl` - Event stream (sync only)
 - `{runId}_{agent}_meta.json` - Timing, usage, exit code, final model, attempted models, and per-attempt outcomes
 
+Quality-gated runs also write extra per-attempt snapshots in same artifact directory:
+- `{runId}_{agent}_qg_attempt-{N}_validator-output.json`
+- `{runId}_{agent}_qg_attempt-{N}_validator-postfix-output.json`
+- `{runId}_{agent}_qg_attempt-{N}_fixer-input.md`
+
+These are snapshots for debugging and indexing. They do not change configured `qualityGate.validationOutput` working-file behavior.
+
 When fallback is used, metadata records both the ordered `attemptedModels` list and `modelAttempts` entries with success/failure, exit code, error, and usage per attempt.
 
 ## Session Logs

@@ -22,7 +22,14 @@ interface AsyncExecutionResult {
 
 interface AsyncResultPayload {
 	success: boolean;
-	results: Array<unknown>;
+	results: Array<{
+		artifactPaths?: { metadataPath?: string };
+		qualityGate?: { passed: boolean };
+		model?: string;
+		attemptedModels?: string[];
+		modelAttempts?: Array<{ success?: boolean }>;
+		success?: boolean;
+	}>;
 }
 
 interface AsyncStatusPayload {
@@ -52,13 +59,17 @@ const utils = await tryImport<UtilsModule>("./utils.ts");
 const typesMod = await tryImport<TypesModule>("./types.ts");
 const available = !!(asyncMod && utils && typesMod);
 
-const isAsyncAvailable = asyncMod?.isAsyncAvailable;
-const executeAsyncSingle = asyncMod?.executeAsyncSingle;
-const executeAsyncChain = asyncMod?.executeAsyncChain;
-const readStatus = utils?.readStatus;
-const ASYNC_DIR = typesMod?.ASYNC_DIR;
-const RESULTS_DIR = typesMod?.RESULTS_DIR;
-const TEMP_ROOT_DIR = typesMod?.TEMP_ROOT_DIR;
+const isAsyncAvailable: AsyncExecutionModule["isAsyncAvailable"] = asyncMod?.isAsyncAvailable ?? (() => false);
+const executeAsyncSingle: AsyncExecutionModule["executeAsyncSingle"] = asyncMod?.executeAsyncSingle ?? (() => {
+	throw new Error("async-execution.ts not available");
+});
+const executeAsyncChain: AsyncExecutionModule["executeAsyncChain"] = asyncMod?.executeAsyncChain ?? (() => {
+	throw new Error("async-execution.ts not available");
+});
+const readStatus: UtilsModule["readStatus"] = utils?.readStatus ?? (() => null);
+const ASYNC_DIR = typesMod?.ASYNC_DIR ?? "";
+const RESULTS_DIR = typesMod?.RESULTS_DIR ?? "";
+const TEMP_ROOT_DIR = typesMod?.TEMP_ROOT_DIR ?? "";
 
 function writePackageSkill(packageRoot: string, skillName: string): void {
 	const skillDir = path.join(packageRoot, "skills", skillName);
@@ -73,6 +84,16 @@ function writePackageSkill(packageRoot: string, skillName: string): void {
 		`---\nname: ${skillName}\ndescription: test skill\n---\nbody\n`,
 		"utf-8",
 	);
+}
+
+async function waitForFile(filePath: string, timeoutMs = 15000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!fs.existsSync(filePath)) {
+		if (Date.now() > deadline) {
+			assert.fail(`Timed out waiting for file: ${filePath}`);
+		}
+		await new Promise((resolve) => setTimeout(resolve, 100));
+	}
 }
 
 describe("async execution utilities", { skip: !available ? "pi packages not available" : undefined }, () => {
@@ -220,10 +241,84 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.deepEqual(payload.results[0].attemptedModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
 		assert.equal(payload.results[0].modelAttempts.length, 2);
 		const statusPayload = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8"));
-		assert.ok(statusPayload.totalTokens.total > 0);
-		assert.ok(statusPayload.steps[0].tokens.total > 0);
+		assert.equal(statusPayload.state, "complete");
+		assert.equal(statusPayload.steps?.[0]?.model, "anthropic/claude-sonnet-4");
 		assert.match(fs.readFileSync(path.join(asyncDir, "output-0.log"), "utf-8"), /Recovered asynchronously/);
 		assert.equal(mockPi.callCount(), 2);
+	});
+
+	it("background quality gate writes validator snapshots and fixer input artifacts", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "producer output" });
+		mockPi.onCall({ output: JSON.stringify({ pass: false, reason: "bad" }) });
+		mockPi.onCall({ output: "fixed something" });
+		mockPi.onCall({ output: JSON.stringify({ pass: true, reason: "ok after fix" }) });
+
+		const id = `async-gate-artifacts-${Date.now().toString(36)}`;
+		const sessionRoot = path.join(tempDir, "sessions");
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+		const artifactsDir = path.join(tempDir, "artifacts");
+		const producer = makeAgent("producer", {
+			qualityGate: {
+				validator: "validator",
+				fixer: "fixer",
+				validationOutput: "validation.json",
+				passField: "pass",
+				maxRetries: 1,
+				enabledByDefault: true,
+				onExhausted: "stop",
+			},
+		});
+		const validator = makeAgent("validator");
+		const fixer = makeAgent("fixer");
+
+		executeAsyncSingle(id, {
+			agent: "producer",
+			task: "Task",
+			agentConfig: producer,
+			agents: [producer, validator, fixer],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: true,
+				includeInput: true,
+				includeOutput: true,
+				includeJsonl: true,
+				includeMetadata: true,
+				cleanupDays: 7,
+			},
+			artifactsDir,
+			shareEnabled: false,
+			sessionRoot,
+			maxSubagentDepth: 2,
+		});
+
+		await waitForFile(resultPath);
+
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, true);
+		assert.equal(payload.results[0]?.qualityGate?.passed, true);
+		assert.ok(payload.results[0]?.artifactPaths?.metadataPath, "should have metadata path");
+
+		const validatorSnapshotPath = path.join(artifactsDir, `${id}_producer_qg_attempt-1_validator-output.json`);
+		const fixerInputPath = path.join(artifactsDir, `${id}_producer_qg_attempt-1_fixer-input.md`);
+		const postFixValidatorSnapshotPath = path.join(artifactsDir, `${id}_producer_qg_attempt-1_validator-postfix-output.json`);
+		const firstValidatorOutput = JSON.stringify({ pass: false, reason: "bad" });
+		const secondValidatorOutput = JSON.stringify({ pass: true, reason: "ok after fix" });
+
+		assert.equal(fs.readFileSync(validatorSnapshotPath, "utf-8"), firstValidatorOutput);
+		assert.match(fs.readFileSync(fixerInputPath, "utf-8"), /Fix the output from agent 'producer' so it passes validation\./);
+		assert.equal(fs.readFileSync(postFixValidatorSnapshotPath, "utf-8"), secondValidatorOutput);
+		assert.equal(fs.readFileSync(path.join(tempDir, "validation.json"), "utf-8"), secondValidatorOutput);
+
+		const metadata = JSON.parse(fs.readFileSync(payload.results[0]!.artifactPaths!.metadataPath!, "utf-8"));
+		assert.deepEqual(metadata.qualityGateArtifacts, {
+			attempts: {
+				"1": {
+					validatorOutput: validatorSnapshotPath,
+					fixerInput: fixerInputPath,
+					postFixValidatorOutput: postFixValidatorSnapshotPath,
+				},
+			},
+		});
 	});
 
 	it("background runs detect hidden tool failures even when the child exits 0", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

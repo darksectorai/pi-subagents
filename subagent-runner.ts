@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Message } from "@mariozechner/pi-ai";
-import { appendJsonl, getArtifactPaths } from "./artifacts.ts";
+import { appendJsonl, getArtifactPaths, getQualityGateArtifactPath } from "./artifacts.ts";
 import { getPiSpawnCommand } from "./pi-spawn.ts";
 import { captureSingleOutputSnapshot, resolveSingleOutput } from "./single-output.ts";
 import {
@@ -209,7 +209,7 @@ function runPiStreaming(
 				return;
 			}
 
-			appendChildEvent(event);
+			appendChildEvent(event as Record<string, unknown>);
 
 			if (event.type === "tool_execution_start" && event.toolName) {
 				const toolArgs = extractToolArgsPreview(event.args ?? {});
@@ -705,6 +705,87 @@ function buildRunnerRetryTask(originalTask: string, validationOutputPath: string
 	].join("\n");
 }
 
+interface RunnerQualityGateAttemptArtifacts {
+	validatorOutput?: string;
+	fixerInput?: string;
+	postFixValidatorOutput?: string;
+}
+
+interface RunnerQualityGateArtifactsMetadata {
+	attempts: Record<string, RunnerQualityGateAttemptArtifacts>;
+}
+
+function recordRunnerQualityGateArtifact(
+	metadata: RunnerQualityGateArtifactsMetadata,
+	attempt: number,
+	field: keyof RunnerQualityGateAttemptArtifacts,
+	filePath: string | undefined,
+): void {
+	if (!filePath) return;
+	const key = String(attempt);
+	const attemptArtifacts = metadata.attempts[key] ??= {};
+	attemptArtifacts[field] = filePath;
+}
+
+function snapshotRunnerQualityGateValidatorOutput(input: {
+	artifactsDir?: string;
+	artifactEnabled: boolean;
+	runId: string;
+	agent: string;
+	attempt: number;
+	kind: "validator-output" | "validator-postfix-output";
+	sourcePath: string;
+	index?: number;
+}): string | undefined {
+	if (!input.artifactEnabled || !input.artifactsDir) return undefined;
+	try {
+		if (!fs.existsSync(input.sourcePath)) return undefined;
+		fs.mkdirSync(input.artifactsDir, { recursive: true });
+		const targetPath = getQualityGateArtifactPath(
+			input.artifactsDir,
+			input.runId,
+			input.agent,
+			input.attempt,
+			input.kind,
+			"json",
+			input.index,
+		);
+		fs.writeFileSync(targetPath, fs.readFileSync(input.sourcePath, "utf-8"), "utf-8");
+		return targetPath;
+	} catch {
+		return undefined;
+	}
+}
+
+function writeRunnerQualityGatePromptArtifact(input: {
+	artifactsDir?: string;
+	artifactEnabled: boolean;
+	runId: string;
+	agent: string;
+	attempt: number;
+	kind: "fixer-input";
+	content: string;
+	index?: number;
+}): string | undefined {
+	if (!input.artifactEnabled || !input.artifactsDir) return undefined;
+	try {
+		fs.mkdirSync(input.artifactsDir, { recursive: true });
+		const targetPath = getQualityGateArtifactPath(
+			input.artifactsDir,
+			input.runId,
+			input.agent,
+			input.attempt,
+			input.kind,
+			"md",
+			input.index,
+		);
+		fs.writeFileSync(targetPath, input.content, "utf-8");
+		return targetPath;
+	} catch {
+		return undefined;
+	}
+}
+
 function refreshRunnerOutputFromFile(
 	result: Awaited<ReturnType<typeof runPlainSingleStep>>,
 	outputPath: string | undefined,
@@ -718,6 +799,35 @@ function refreshRunnerOutputFromFile(
 	}
 }
 
+function writeRunnerQualityGateMetadata(input: {
+	result: Awaited<ReturnType<typeof runPlainSingleStep>>;
+	runId: string;
+	agent: string;
+	task: string;
+	skills?: string[];
+	artifactEnabled: boolean;
+	includeMetadata: boolean;
+	qualityGateArtifacts: RunnerQualityGateArtifactsMetadata;
+}): void {
+	if (!input.artifactEnabled || !input.includeMetadata || !input.result.artifactPaths?.metadataPath) return;
+	const metadata: Record<string, unknown> = {
+		runId: input.runId,
+		agent: input.agent,
+		task: input.task,
+		exitCode: input.result.exitCode,
+		model: input.result.model,
+		attemptedModels: input.result.attemptedModels,
+		modelAttempts: input.result.modelAttempts,
+		skills: input.skills,
+		qualityGate: input.result.qualityGate,
+		timestamp: Date.now(),
+	};
+	if (Object.keys(input.qualityGateArtifacts.attempts).length > 0) {
+		metadata.qualityGateArtifacts = input.qualityGateArtifacts;
+	}
+	fs.writeFileSync(input.result.artifactPaths.metadataPath, JSON.stringify(metadata, null, 2), "utf-8");
+}
+
 async function runSingleStep(
 	step: SubagentStep,
 	ctx: SingleStepContext,
@@ -728,6 +838,24 @@ async function runSingleStep(
 	}
 
 	const originalTask = step.task;
+	const resolvedOriginalTask = step.task.replace(new RegExp(ctx.placeholder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), () => ctx.previousOutput);
+	const artifactEnabled = Boolean(ctx.artifactsDir) && ctx.artifactConfig?.enabled !== false;
+	const qualityGateArtifacts: RunnerQualityGateArtifactsMetadata = { attempts: {} };
+	const metadataTask = resolvedOriginalTask;
+	const persistQualityGateMetadata = (result: Awaited<ReturnType<typeof runPlainSingleStep>>): Awaited<ReturnType<typeof runPlainSingleStep>> => {
+		writeRunnerQualityGateMetadata({
+			result,
+			runId: ctx.id,
+			agent: step.agent,
+			task: metadataTask,
+			skills: step.skills,
+			artifactEnabled,
+			includeMetadata: ctx.artifactConfig?.includeMetadata !== false,
+			qualityGateArtifacts,
+		});
+		return result;
+	};
+	const qualityGateArtifactIndex = ctx.flatStepCount > 1 ? ctx.flatIndex : undefined;
 	const runs: QualityGateResult["runs"] = [];
 	let attempts = 0;
 	let lastPass = false;
@@ -750,7 +878,7 @@ async function runSingleStep(
 			exhausted: exhausted || undefined,
 			onExhausted: gate.onExhausted,
 			attempts,
-			currentPhase: runs.at(-1)?.phase,
+			currentPhase: runs.length > 0 ? runs[runs.length - 1]?.phase : undefined,
 			validationOutput: validationOutputPath,
 			validatorOutputSchema: gate.validatorOutputSchemaPath,
 			lastPass,
@@ -786,7 +914,7 @@ async function runSingleStep(
 		runs.push({ phase: "producer", agent: step.agent, attempt, exitCode: producer.exitCode ?? 1, error: producer.error });
 		if (producer.exitCode !== 0) {
 			producer.qualityGate = emitGate(false, producer.error || "Producer failed.");
-			return producer;
+			return persistQualityGateMetadata(producer);
 		}
 
 		const attemptValidationOutputPath = resolveQualityGateOutputPath(gate.validationOutput, step.cwd ?? ctx.cwd, {
@@ -809,11 +937,26 @@ async function runSingleStep(
 			outputFile: gateOutputFile(ctx.outputFile, "validator", attempt),
 		});
 		runs.push({ phase: "validator", agent: gate.validator, attempt, exitCode: validator.exitCode ?? 1, validationOutput: attemptValidationOutputPath, error: validator.error });
+		recordRunnerQualityGateArtifact(
+			qualityGateArtifacts,
+			attempt,
+			"validatorOutput",
+			snapshotRunnerQualityGateValidatorOutput({
+				artifactsDir: ctx.artifactsDir,
+				artifactEnabled,
+				runId: ctx.id,
+				agent: step.agent,
+				attempt,
+				kind: "validator-output",
+				sourcePath: attemptValidationOutputPath,
+				index: qualityGateArtifactIndex,
+			}),
+		);
 		if (validator.exitCode !== 0) {
 			producer.qualityGate = emitGate(false, validator.error || "Validator failed.");
 			producer.exitCode = producer.exitCode === 0 ? 1 : producer.exitCode;
 			producer.error = producer.qualityGate.error;
-			return producer;
+			return persistQualityGateMetadata(producer);
 		}
 
 		let artifact;
@@ -825,14 +968,14 @@ async function runSingleStep(
 			producer.qualityGate = emitGate(false, message);
 			producer.exitCode = 1;
 			producer.error = message;
-			return producer;
+			return persistQualityGateMetadata(producer);
 		}
 		lastValidationRaw = artifact.raw;
 		lastPass = artifact.pass;
 		runs[runs.length - 1]!.pass = artifact.pass;
 		if (artifact.pass) {
 			producer.qualityGate = emitGate(true);
-			return producer;
+			return persistQualityGateMetadata(producer);
 		}
 
 		if (!gate.fixerStep || !gate.fixer) {
@@ -843,7 +986,7 @@ async function runSingleStep(
 					producer.exitCode = 1;
 					producer.error = message;
 				}
-				return producer;
+				return persistQualityGateMetadata(producer);
 			}
 			continue;
 		}
@@ -856,6 +999,21 @@ async function runSingleStep(
 			validationArtifact: summarizeValidatorArtifact(artifact.raw),
 			outputPath: step.outputPath,
 		});
+		recordRunnerQualityGateArtifact(
+			qualityGateArtifacts,
+			attempt,
+			"fixerInput",
+			writeRunnerQualityGatePromptArtifact({
+				artifactsDir: ctx.artifactsDir,
+				artifactEnabled,
+				runId: ctx.id,
+				agent: step.agent,
+				attempt,
+				kind: "fixer-input",
+				content: fixerTask,
+				index: qualityGateArtifactIndex,
+			}),
+		);
 		const fixer = await runPlainSingleStep({ ...gate.fixerStep, task: fixerTask }, {
 			...ctx,
 			outputFile: gateOutputFile(ctx.outputFile, "fixer", attempt),
@@ -865,7 +1023,7 @@ async function runSingleStep(
 			producer.qualityGate = emitGate(false, fixer.error || "Fixer failed.");
 			producer.exitCode = 1;
 			producer.error = producer.qualityGate.error;
-			return producer;
+			return persistQualityGateMetadata(producer);
 		}
 
 		refreshRunnerOutputFromFile(producer, step.outputPath);
@@ -883,11 +1041,26 @@ async function runSingleStep(
 			outputFile: gateOutputFile(ctx.outputFile, "validator-fixed", attempt),
 		});
 		runs.push({ phase: "validator", agent: gate.validator, attempt, exitCode: postFixValidator.exitCode ?? 1, validationOutput: attemptValidationOutputPath, error: postFixValidator.error });
+		recordRunnerQualityGateArtifact(
+			qualityGateArtifacts,
+			attempt,
+			"postFixValidatorOutput",
+			snapshotRunnerQualityGateValidatorOutput({
+				artifactsDir: ctx.artifactsDir,
+				artifactEnabled,
+				runId: ctx.id,
+				agent: step.agent,
+				attempt,
+				kind: "validator-postfix-output",
+				sourcePath: attemptValidationOutputPath,
+				index: qualityGateArtifactIndex,
+			}),
+		);
 		if (postFixValidator.exitCode !== 0) {
 			producer.qualityGate = emitGate(false, postFixValidator.error || "Validator failed after fixer.");
 			producer.exitCode = 1;
 			producer.error = producer.qualityGate.error;
-			return producer;
+			return persistQualityGateMetadata(producer);
 		}
 		try {
 			artifact = readValidatorArtifact(attemptValidationOutputPath, gate.passField, validateSchema);
@@ -897,14 +1070,14 @@ async function runSingleStep(
 			producer.qualityGate = emitGate(false, message);
 			producer.exitCode = 1;
 			producer.error = message;
-			return producer;
+			return persistQualityGateMetadata(producer);
 		}
 		lastValidationRaw = artifact.raw;
 		lastPass = artifact.pass;
 		runs[runs.length - 1]!.pass = artifact.pass;
 		if (artifact.pass) {
 			producer.qualityGate = emitGate(true);
-			return producer;
+			return persistQualityGateMetadata(producer);
 		}
 	}
 
@@ -920,7 +1093,7 @@ async function runSingleStep(
 		base.exitCode = 1;
 		base.error = message;
 	}
-	return base;
+	return persistQualityGateMetadata(base);
 }
 
 type RunnerStatusPayload = {

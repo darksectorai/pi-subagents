@@ -21,7 +21,20 @@ function getTermWidth(): number {
 	return process.stdout.columns || 120;
 }
 
-const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+type SegmenterLike = {
+	segment(input: string): Iterable<{ segment: string }>;
+};
+
+const segmenter: SegmenterLike | undefined = "Segmenter" in Intl
+	? new (Intl as typeof Intl & {
+		Segmenter: new (locales?: string | string[], options?: { granularity: "grapheme" }) => SegmenterLike;
+	}).Segmenter(undefined, { granularity: "grapheme" })
+	: undefined;
+
+function getGraphemes(text: string): string[] {
+	if (!segmenter) return Array.from(text);
+	return Array.from(segmenter.segment(text), (entry) => entry.segment);
+}
 
 /**
  * Truncate a line to maxWidth, preserving ANSI styling through the ellipsis.
@@ -62,8 +75,7 @@ function truncLine(text: string, maxWidth: number): string {
 		}
 
 		const textPortion = text.slice(i, end);
-		for (const seg of segmenter.segment(textPortion)) {
-			const grapheme = seg.segment;
+		for (const grapheme of getGraphemes(textPortion)) {
 			const graphemeWidth = visibleWidth(grapheme);
 
 			if (currentWidth + graphemeWidth > targetWidth) {
@@ -136,6 +148,15 @@ function formatCurrentToolLine(progress: Pick<AgentProgress, "currentTool" | "cu
 	return toolArgsPreview
 		? `${progress.currentTool}: ${toolArgsPreview}${durationSuffix}`
 		: `${progress.currentTool}${durationSuffix}`;
+}
+
+function formatQualityGateLine(qualityGate: NonNullable<Details["results"]>[number]["qualityGate"]): string {
+	if (qualityGate?.passed) {
+		if ((qualityGate.attempts ?? 0) <= 1) return "No errors, passed";
+		return `passed after ${qualityGate.attempts} attempt`;
+	}
+	const verdict = qualityGate?.exhausted ? "exhausted" : "failed";
+	return `${verdict} after ${qualityGate?.attempts ?? 0} attempt(s)`;
 }
 
 function buildLiveStatusLine(progress: Pick<AgentProgress, "lastActivityAt">): string | undefined {
@@ -303,8 +324,7 @@ export function renderSubagentResult(
 			c.addChild(new Text(fit(theme.fg("dim", `Fallbacks: ${r.attemptedModels.join(" → ")}`)), 0, 0));
 		}
 		if (r.qualityGate) {
-			const verdict = r.qualityGate.passed ? "passed" : r.qualityGate.exhausted ? "exhausted" : "failed";
-			c.addChild(new Text(fit(theme.fg(r.qualityGate.passed ? "success" : "warning", `Quality gate: ${verdict} after ${r.qualityGate.attempts} attempt(s)`)), 0, 0));
+			c.addChild(new Text(fit(theme.fg(r.qualityGate.passed ? "success" : "warning", `Quality gate: ${formatQualityGateLine(r.qualityGate)}`)), 0, 0));
 		}
 		c.addChild(new Text(fit(theme.fg("dim", formatUsage(r.usage, r.model))), 0, 0));
 		if (r.sessionFile) {
@@ -422,9 +442,10 @@ export function renderSubagentResult(
 
 		const progressFromArray = d.progress?.find((p) => p.index === i) 
 			|| d.progress?.find((p) => p.agent === r.agent && p.status === "running");
-		const rProg = r.progress || progressFromArray || r.progressSummary;
-		const rRunning = rProg?.status === "running";
-		const stepNumber = typeof rProg?.index === "number" ? rProg.index + 1 : i + 1;
+		const liveProg = r.progress || progressFromArray;
+		const rProg = liveProg || r.progressSummary;
+		const rRunning = liveProg?.status === "running";
+		const stepNumber = typeof liveProg?.index === "number" ? liveProg.index + 1 : i + 1;
 
 		const resultOutput = getSingleResultOutput(r);
 		const statusIcon = rRunning
@@ -463,19 +484,18 @@ export function renderSubagentResult(
 			c.addChild(new Text(fit(theme.fg("dim", `    fallbacks: ${r.attemptedModels.join(" → ")}`)), 0, 0));
 		}
 		if (r.qualityGate) {
-			const verdict = r.qualityGate.passed ? "passed" : r.qualityGate.exhausted ? "exhausted" : "failed";
-			c.addChild(new Text(fit(theme.fg(r.qualityGate.passed ? "success" : "warning", `    quality gate: ${verdict} after ${r.qualityGate.attempts} attempt(s)`)), 0, 0));
+			c.addChild(new Text(fit(theme.fg(r.qualityGate.passed ? "success" : "warning", `    quality gate: ${formatQualityGateLine(r.qualityGate)}`)), 0, 0));
 		}
 
-		if (rRunning && rProg) {
-			if (rProg.skills?.length) {
-				c.addChild(new Text(fit(theme.fg("accent", `    skills: ${rProg.skills.join(", ")}`)), 0, 0));
+		if (rRunning && liveProg) {
+			if (liveProg.skills?.length) {
+				c.addChild(new Text(fit(theme.fg("accent", `    skills: ${liveProg.skills.join(", ")}`)), 0, 0));
 			}
-			const toolLine = formatCurrentToolLine(rProg, w, expanded);
+			const toolLine = formatCurrentToolLine(liveProg, w, expanded);
 			if (toolLine) {
 				c.addChild(new Text(fit(theme.fg("warning", `    > ${toolLine}`)), 0, 0));
 			}
-			const liveStatusLine = buildLiveStatusLine(rProg);
+			const liveStatusLine = buildLiveStatusLine(liveProg);
 			if (liveStatusLine) {
 				c.addChild(new Text(fit(theme.fg("accent", `    ${liveStatusLine}`)), 0, 0));
 			}
@@ -483,8 +503,8 @@ export function renderSubagentResult(
 			if (r.artifactPaths) {
 				c.addChild(new Text(fit(theme.fg("dim", `    artifacts: ${shortenPath(r.artifactPaths.outputPath)}`)), 0, 0));
 			}
-			if (rProg.recentTools?.length) {
-				for (const t of rProg.recentTools.slice(-3)) {
+			if (liveProg.recentTools?.length) {
+				for (const t of liveProg.recentTools.slice(-3)) {
 					const maxArgsLen = Math.max(40, w - 30);
 					const argsPreview = expanded || t.args.length <= maxArgsLen
 						? t.args
@@ -492,7 +512,7 @@ export function renderSubagentResult(
 					c.addChild(new Text(fit(theme.fg("dim", `      ${t.tool}: ${argsPreview}`)), 0, 0));
 				}
 			}
-			const recentLines = (rProg.recentOutput ?? []).slice(-5);
+			const recentLines = liveProg.recentOutput.slice(-5);
 			for (const line of recentLines) {
 				c.addChild(new Text(fit(theme.fg("dim", `      ${line}`)), 0, 0));
 			}

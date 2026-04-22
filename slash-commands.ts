@@ -4,6 +4,7 @@ import { Key, matchesKey } from "@mariozechner/pi-tui";
 import { discoverAgents, discoverAgentsAll } from "./agents.ts";
 import { AgentManagerComponent, type ManagerResult } from "./agent-manager.ts";
 import { SubagentsStatusComponent } from "./subagents-status.ts";
+import { formatSlashStatusText } from "./slash-progress.ts";
 import { discoverAvailableSkills } from "./skills.ts";
 import type { SubagentParamsLike } from "./subagent-executor.ts";
 import type { SlashSubagentResponse, SlashSubagentUpdate } from "./slash-bridge.ts";
@@ -113,6 +114,14 @@ async function requestSlashRun(
 	return new Promise((resolve, reject) => {
 		let done = false;
 		let started = false;
+		let liveStatusText = "running... | Ctrl+O live detail";
+
+		const liveStatusTimer = ctx.hasUI
+			? setInterval(() => {
+				ctx.ui.setStatus("subagent-slash", liveStatusText);
+			}, 250)
+			: undefined;
+		liveStatusTimer?.unref?.();
 
 		const startTimeoutMs = 15_000;
 		const startTimeout = setTimeout(() => {
@@ -126,7 +135,8 @@ async function requestSlashRun(
 			if ((data as { requestId?: unknown }).requestId !== requestId) return;
 			started = true;
 			clearTimeout(startTimeout);
-			if (ctx.hasUI) ctx.ui.setStatus("subagent-slash", "running...");
+			liveStatusText = "running... | Ctrl+O live detail";
+			if (ctx.hasUI) ctx.ui.setStatus("subagent-slash", liveStatusText);
 		};
 
 		const onResponse = (data: unknown) => {
@@ -142,10 +152,9 @@ async function requestSlashRun(
 			const update = data as SlashSubagentUpdate;
 			if (update.requestId !== requestId) return;
 			applySlashUpdate(requestId, update);
+			liveStatusText = formatSlashStatusText(update.progress);
 			if (!ctx.hasUI) return;
-			const tool = update.currentTool ? ` ${update.currentTool}` : "";
-			const count = update.toolCount ?? 0;
-			ctx.ui.setStatus("subagent-slash", `${count} tools${tool} | Ctrl+O live detail`);
+			ctx.ui.setStatus("subagent-slash", liveStatusText);
 		};
 
 		const onTerminalInput = ctx.hasUI
@@ -165,6 +174,7 @@ async function requestSlashRun(
 			if (done) return;
 			done = true;
 			clearTimeout(startTimeout);
+			if (liveStatusTimer) clearInterval(liveStatusTimer);
 			unsubStarted();
 			unsubResponse();
 			unsubUpdate();

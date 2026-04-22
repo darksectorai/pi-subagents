@@ -42,6 +42,7 @@ interface ProgressSummary {
 
 interface ArtifactPaths {
 	outputPath: string;
+	metadataPath?: string;
 }
 
 interface RunSyncResult {
@@ -65,6 +66,7 @@ interface RunSyncResult {
 	qualityGate?: {
 		passed: boolean;
 		exhausted?: boolean;
+		onExhausted?: "stop" | "continue";
 		attempts: number;
 		runs: Array<{ phase: string; agent: string; pass?: boolean }>;
 	};
@@ -92,10 +94,10 @@ interface TypesModule {
 const execution = await tryImport<ExecutionModule>("./execution.ts");
 const utils = await tryImport<UtilsModule>("./utils.ts");
 const types = await tryImport<TypesModule>("./types.ts");
-const available = !!(execution && utils);
+const available = !!(execution?.runSync && utils?.getFinalOutput);
 
-const runSync = execution?.runSync;
-const getFinalOutput = utils?.getFinalOutput;
+const runSync = execution?.runSync as ExecutionModule["runSync"];
+const getFinalOutput = utils?.getFinalOutput as UtilsModule["getFinalOutput"];
 const INTERCOM_DETACH_REQUEST_EVENT = types?.INTERCOM_DETACH_REQUEST_EVENT ?? "pi-intercom:detach-request";
 const INTERCOM_DETACH_RESPONSE_EVENT = types?.INTERCOM_DETACH_RESPONSE_EVENT ?? "pi-intercom:detach-response";
 
@@ -157,10 +159,10 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 	});
 
 	function readCallArgs(): string[] {
-		const callFile = fs.readdirSync(mockPi.dir)
+		const callFiles = fs.readdirSync(mockPi.dir)
 			.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
-			.sort()
-			.at(-1);
+			.sort();
+		const callFile = callFiles[callFiles.length - 1];
 		assert.ok(callFile, "expected a recorded mock pi call");
 		const payload = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")) as { args?: string[] };
 		assert.ok(Array.isArray(payload.args), "expected recorded args");
@@ -221,8 +223,45 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.exitCode, 0);
 		assert.equal(mockPi.callCount(), 2);
 		assert.equal(result.qualityGate?.passed, true);
-		assert.equal(result.qualityGate?.runs.at(-1)?.pass, true);
+		const qualityRuns = result.qualityGate?.runs ?? [];
+		assert.equal(qualityRuns[qualityRuns.length - 1]?.pass, true);
 		assert.equal(fs.readFileSync(path.join(tempDir, "validation.json"), "utf-8"), JSON.stringify({ pass: true, reason: "ok" }));
+	});
+
+	it("streams live updates while quality gate phases run", async () => {
+		const updates: Array<{ details?: { progress?: ProgressSummary[] } }> = [];
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("read", { path: "input.txt" })], delay: 20 },
+				{ jsonl: [events.toolEnd("read"), events.toolResult("read", "producer context"), events.assistantMessage("producer output")], delay: 20 },
+			],
+		});
+		mockPi.onCall({ output: JSON.stringify({ pass: true, reason: "ok" }) });
+		const agents = [
+			makeAgent("producer", {
+				qualityGate: {
+					validator: "validator",
+					validationOutput: "validation.json",
+					passField: "pass",
+					maxRetries: 1,
+					enabledByDefault: true,
+					onExhausted: "stop",
+				},
+			}),
+			makeAgent("validator"),
+		];
+
+		const result = await runSync(tempDir, agents, "producer", "Task", {
+			runId: "gate-live",
+			onUpdate: (update: { details?: { progress?: ProgressSummary[] } }) => updates.push(update),
+		});
+
+		assert.equal(result.exitCode, 0);
+		assert.ok(updates.length > 0, "expected live updates during quality-gated run");
+		const runningToolUpdate = updates.find((update) => update.details?.progress?.[0]?.currentTool === "read");
+		assert.ok(runningToolUpdate, "expected running tool update from producer phase");
+		assert.equal(runningToolUpdate?.details?.progress?.[0]?.agent, "producer");
+		assert.equal(runningToolUpdate?.details?.progress?.[0]?.status, "running");
 	});
 
 	it("can disable a configured quality gate for one run", async () => {
@@ -393,6 +432,62 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.qualityGate?.exhausted, true);
 		assert.match(result.error ?? "", /Quality gate exhausted/);
 		assert.deepEqual(result.qualityGate?.runs.map((run) => run.phase), ["producer", "validator", "fixer", "validator"]);
+	});
+
+	it("writes quality gate validator snapshots and fixer input artifacts", async () => {
+		mockPi.onCall({ output: "producer output" });
+		mockPi.onCall({ output: JSON.stringify({ pass: false, reason: "bad" }) });
+		mockPi.onCall({ output: "fixed something" });
+		mockPi.onCall({ output: JSON.stringify({ pass: true, reason: "ok after fix" }) });
+		const artifactsDir = path.join(tempDir, "artifacts");
+		const agents = [
+			makeAgent("producer", {
+				qualityGate: {
+					validator: "validator",
+					fixer: "fixer",
+					validationOutput: "validation.json",
+					passField: "pass",
+					maxRetries: 1,
+					enabledByDefault: true,
+					onExhausted: "stop",
+				},
+			}),
+			makeAgent("validator"),
+			makeAgent("fixer"),
+		];
+
+		const result = await runSync(tempDir, agents, "producer", "Task", {
+			runId: "gate-artifacts",
+			artifactsDir,
+			artifactConfig: { enabled: true, includeInput: true, includeOutput: true, includeJsonl: true, includeMetadata: true, cleanupDays: 7 },
+		});
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.qualityGate?.passed, true);
+		assert.ok(result.artifactPaths?.metadataPath, "should have metadata path");
+
+		const validatorSnapshotPath = path.join(artifactsDir, "gate-artifacts_producer_qg_attempt-1_validator-output.json");
+		const fixerInputPath = path.join(artifactsDir, "gate-artifacts_producer_qg_attempt-1_fixer-input.md");
+		const postFixValidatorSnapshotPath = path.join(artifactsDir, "gate-artifacts_producer_qg_attempt-1_validator-postfix-output.json");
+		const firstValidatorOutput = JSON.stringify({ pass: false, reason: "bad" });
+		const secondValidatorOutput = JSON.stringify({ pass: true, reason: "ok after fix" });
+
+		assert.equal(fs.readFileSync(validatorSnapshotPath, "utf-8"), firstValidatorOutput);
+		assert.match(fs.readFileSync(fixerInputPath, "utf-8"), /Fix the output from agent 'producer' so it passes validation\./);
+		assert.match(fs.readFileSync(fixerInputPath, "utf-8"), /"reason":"bad"/);
+		assert.equal(fs.readFileSync(postFixValidatorSnapshotPath, "utf-8"), secondValidatorOutput);
+		assert.equal(fs.readFileSync(path.join(tempDir, "validation.json"), "utf-8"), secondValidatorOutput);
+
+		const metadata = JSON.parse(fs.readFileSync(result.artifactPaths.metadataPath!, "utf-8"));
+		assert.deepEqual(metadata.qualityGateArtifacts, {
+			attempts: {
+				"1": {
+					validatorOutput: validatorSnapshotPath,
+					fixerInput: fixerInputPath,
+					postFixValidatorOutput: postFixValidatorSnapshotPath,
+				},
+			},
+		});
 	});
 
 	it("handles long tasks via temp file (ENAMETOOLONG prevention)", async () => {

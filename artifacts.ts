@@ -12,16 +12,39 @@ export function getArtifactsDir(sessionFile: string | null): string {
 	return TEMP_ARTIFACTS_DIR;
 }
 
-export function getArtifactPaths(artifactsDir: string, runId: string, agent: string, index?: number): ArtifactPaths {
+function sanitizeArtifactSegment(value: string): string {
+	return value.replace(/[^\w.-]/g, "_");
+}
+
+function getArtifactBaseName(runId: string, agent: string, index?: number): string {
 	const suffix = index !== undefined ? `_${index}` : "";
-	const safeAgent = agent.replace(/[^\w.-]/g, "_");
-	const base = `${runId}_${safeAgent}${suffix}`;
+	const safeAgent = sanitizeArtifactSegment(agent);
+	return `${runId}_${safeAgent}${suffix}`;
+}
+
+export function getArtifactPaths(artifactsDir: string, runId: string, agent: string, index?: number): ArtifactPaths {
+	const base = getArtifactBaseName(runId, agent, index);
 	return {
 		inputPath: path.join(artifactsDir, `${base}_input.md`),
 		outputPath: path.join(artifactsDir, `${base}_output.md`),
 		jsonlPath: path.join(artifactsDir, `${base}.jsonl`),
 		metadataPath: path.join(artifactsDir, `${base}_meta.json`),
 	};
+}
+
+export function getQualityGateArtifactPath(
+	artifactsDir: string,
+	runId: string,
+	agent: string,
+	attempt: number,
+	kind: string,
+	ext: string,
+	index?: number,
+): string {
+	const base = getArtifactBaseName(runId, agent, index);
+	const safeKind = sanitizeArtifactSegment(kind);
+	const normalizedExt = ext.startsWith(".") ? ext : `.${ext}`;
+	return path.join(artifactsDir, `${base}_qg_attempt-${attempt}_${safeKind}${normalizedExt}`);
 }
 
 export function ensureArtifactsDir(dir: string): void {

@@ -9,12 +9,14 @@ import type { AgentConfig } from "./agents.ts";
 import {
 	ensureArtifactsDir,
 	getArtifactPaths,
+	getQualityGateArtifactPath,
 	writeArtifact,
 	writeMetadata,
 } from "./artifacts.ts";
 import {
 	type AgentProgress,
 	type ArtifactPaths,
+	type Details,
 	type ModelAttempt,
 	type ProgressSummary,
 	type RunSyncOptions,
@@ -137,11 +139,12 @@ async function runSingleAttempt(
 		promptFileStem: agent.name,
 	});
 
+	const messages: Message[] = [];
 	const result: SingleResult = {
 		agent: agent.name,
 		task,
 		exitCode: 0,
-		messages: [],
+		messages,
 		usage: emptyUsage(),
 		model: modelArg,
 		artifactPaths: shared.artifactPaths,
@@ -267,7 +270,7 @@ async function runSingleAttempt(
 		const fireUpdate = () => {
 			if (!options.onUpdate || processClosed) return;
 			progress.durationMs = Date.now() - startTime;
-			emitUpdateSnapshot(getFinalOutput(result.messages) || "(running...)");
+			emitUpdateSnapshot(getFinalOutput(messages) || "(running...)");
 		};
 
 		const processLine = (line: string) => {
@@ -311,7 +314,7 @@ async function runSingleAttempt(
 			}
 
 			if (evt.type === "message_end" && evt.message) {
-				result.messages.push(evt.message);
+				messages.push(evt.message);
 				if (evt.message.role === "assistant") {
 					result.usage.turns++;
 					const u = evt.message.usage;
@@ -338,7 +341,7 @@ async function runSingleAttempt(
 			}
 
 			if (evt.type === "tool_result_end" && evt.message) {
-				result.messages.push(evt.message);
+				messages.push(evt.message);
 				appendRecentOutput(progress, extractTextFromContent(evt.message.content).split("\n").slice(-10));
 				fireUpdate();
 			}
@@ -417,7 +420,7 @@ async function runSingleAttempt(
 	}
 
 	if (exitCode === 0 && !result.error) {
-		const errInfo = detectSubagentError(result.messages);
+		const errInfo = detectSubagentError(messages);
 		if (errInfo.hasError) {
 			result.exitCode = errInfo.exitCode ?? 1;
 			result.error = errInfo.details
@@ -441,7 +444,7 @@ async function runSingleAttempt(
 		durationMs: progress.durationMs,
 	};
 
-	let fullOutput = getFinalOutput(result.messages);
+	let fullOutput = getFinalOutput(messages);
 	if (options.outputPath && result.exitCode === 0) {
 		const resolvedOutput = resolveSingleOutput(options.outputPath, fullOutput, shared.outputSnapshot);
 		fullOutput = resolvedOutput.fullOutput;
@@ -654,6 +657,107 @@ function refreshOutputFromFile(result: SingleResult, outputPath: string | undefi
 	}
 }
 
+function emitQualityGateLiveUpdate(input: {
+	onUpdate: RunSyncOptions["onUpdate"];
+	agent: AgentConfig;
+	task: string;
+	index?: number;
+	compiled: {
+		validationOutputPath: string;
+		schemaPath?: string;
+	};
+	runs: NonNullable<SingleResult["qualityGate"]>["runs"];
+	completedResults: SingleResult[];
+	phase: "producer" | "validator" | "fixer";
+	attempt: number;
+	lastPass: boolean;
+	update: {
+		content?: Array<{ type?: string; text?: string }>;
+		details?: Details;
+	};
+}): void {
+	if (!input.onUpdate) return;
+	const childResult = input.update.details?.results?.[0];
+	const childProgress = input.update.details?.progress?.[0] ?? childResult?.progress;
+	if (!childResult && !childProgress) return;
+
+	const usage = emptyUsage();
+	for (const result of input.completedResults) sumUsage(usage, result.usage);
+	if (childResult) sumUsage(usage, childResult.usage);
+
+	const completedSummary = mergeProgressSummary(input.completedResults);
+	const childToolCount = childProgress?.toolCount ?? childResult?.progressSummary?.toolCount ?? 0;
+	const childDurationMs = childProgress?.durationMs ?? childResult?.progressSummary?.durationMs ?? 0;
+	const phaseLabel = `Quality gate: ${input.phase} attempt ${input.attempt}`;
+	const phaseAgent = childProgress?.agent ?? childResult?.agent;
+	const phaseLine = phaseAgent && phaseAgent !== input.agent.name ? `${phaseLabel} (${phaseAgent})` : phaseLabel;
+
+	const progress: AgentProgress = {
+		index: input.index ?? 0,
+		agent: input.agent.name,
+		status: "running",
+		task: input.task,
+		skills: childProgress?.skills ?? childResult?.skills,
+		lastActivityAt: childProgress?.lastActivityAt,
+		currentTool: childProgress?.currentTool,
+		currentToolArgs: childProgress?.currentToolArgs,
+		currentToolStartedAt: childProgress?.currentToolStartedAt,
+		recentTools: childProgress?.recentTools ? [...childProgress.recentTools] : [],
+		recentOutput: [phaseLine, ...(childProgress?.recentOutput ?? [])].slice(-50),
+		toolCount: completedSummary.toolCount + childToolCount,
+		tokens: usage.input + usage.output,
+		durationMs: completedSummary.durationMs + childDurationMs,
+		...(childProgress?.failedTool ? { failedTool: childProgress.failedTool } : {}),
+		...(childProgress?.error ? { error: childProgress.error } : {}),
+	};
+
+	const result: SingleResult = {
+		agent: input.agent.name,
+		task: input.task,
+		exitCode: childResult?.exitCode ?? 0,
+		messages: childResult?.messages ? [...childResult.messages] : [],
+		usage,
+		model: childResult?.model,
+		artifactPaths: childResult?.artifactPaths,
+		skills: childResult?.skills,
+		skillsWarning: childResult?.skillsWarning,
+		progress,
+		progressSummary: {
+			toolCount: progress.toolCount,
+			tokens: progress.tokens,
+			durationMs: progress.durationMs,
+		},
+		qualityGate: {
+			enabled: true,
+			passed: false,
+			attempts: input.attempt,
+			currentPhase: input.phase,
+			validationOutput: input.compiled.validationOutputPath,
+			validatorOutputSchema: input.compiled.schemaPath,
+			lastPass: input.lastPass,
+			runs: input.runs,
+		},
+		...(childResult?.attemptedModels ? { attemptedModels: [...childResult.attemptedModels] } : {}),
+		...(childResult?.modelAttempts
+			? { modelAttempts: childResult.modelAttempts.map((attempt) => ({ ...attempt, usage: attempt.usage ? { ...attempt.usage } : undefined })) }
+			: {}),
+		...(childResult?.savedOutputPath ? { savedOutputPath: childResult.savedOutputPath } : {}),
+		...(childResult?.outputSaveError ? { outputSaveError: childResult.outputSaveError } : {}),
+		...(childResult?.truncation ? { truncation: { ...childResult.truncation } } : {}),
+		...(childResult?.finalOutput ? { finalOutput: childResult.finalOutput } : {}),
+		...(childResult?.error ? { error: childResult.error } : {}),
+	};
+
+	const text = childResult?.finalOutput
+		|| childResult?.error
+		|| input.update.content?.find((part) => part.type === "text")?.text
+		|| phaseLine;
+	input.onUpdate({
+		content: [{ type: "text", text }],
+		details: { mode: "single", results: [result], progress: [progress] },
+	});
+}
+
 function buildValidatorTask(input: {
 	agentName: string;
 	originalTask: string;
@@ -713,6 +817,120 @@ function buildRetryTask(originalTask: string, validationOutputPath: string, vali
 	].join("\n");
 }
 
+interface QualityGateAttemptArtifacts {
+	validatorOutput?: string;
+	fixerInput?: string;
+	postFixValidatorOutput?: string;
+}
+
+interface QualityGateArtifactsMetadata {
+	attempts: Record<string, QualityGateAttemptArtifacts>;
+}
+
+function recordQualityGateArtifact(
+	metadata: QualityGateArtifactsMetadata,
+	attempt: number,
+	field: keyof QualityGateAttemptArtifacts,
+	filePath: string | undefined,
+): void {
+	if (!filePath) return;
+	const key = String(attempt);
+	const attemptArtifacts = metadata.attempts[key] ??= {};
+	attemptArtifacts[field] = filePath;
+}
+
+function snapshotQualityGateValidatorOutput(input: {
+	artifactsDir?: string;
+	artifactEnabled: boolean;
+	runId: string;
+	agent: string;
+	attempt: number;
+	kind: "validator-output" | "validator-postfix-output";
+	sourcePath: string;
+	index?: number;
+}): string | undefined {
+	if (!input.artifactEnabled || !input.artifactsDir) return undefined;
+	try {
+		if (!fs.existsSync(input.sourcePath)) return undefined;
+		ensureArtifactsDir(input.artifactsDir);
+		const targetPath = getQualityGateArtifactPath(
+			input.artifactsDir,
+			input.runId,
+			input.agent,
+			input.attempt,
+			input.kind,
+			"json",
+			input.index,
+		);
+		writeArtifact(targetPath, fs.readFileSync(input.sourcePath, "utf-8"));
+		return targetPath;
+	} catch {
+		return undefined;
+	}
+}
+
+function writeQualityGatePromptArtifact(input: {
+	artifactsDir?: string;
+	artifactEnabled: boolean;
+	runId: string;
+	agent: string;
+	attempt: number;
+	kind: "fixer-input";
+	content: string;
+	index?: number;
+}): string | undefined {
+	if (!input.artifactEnabled || !input.artifactsDir) return undefined;
+	try {
+		ensureArtifactsDir(input.artifactsDir);
+		const targetPath = getQualityGateArtifactPath(
+			input.artifactsDir,
+			input.runId,
+			input.agent,
+			input.attempt,
+			input.kind,
+			"md",
+			input.index,
+		);
+		writeArtifact(targetPath, input.content);
+		return targetPath;
+	} catch {
+		return undefined;
+	}
+}
+
+function writeQualityGateMetadata(input: {
+	result: SingleResult;
+	runId: string;
+	agent: string;
+	task: string;
+	artifactEnabled: boolean;
+	includeMetadata: boolean;
+	qualityGateArtifacts: QualityGateArtifactsMetadata;
+}): void {
+	if (!input.artifactEnabled || !input.includeMetadata || !input.result.artifactPaths?.metadataPath) return;
+	const metadata: Record<string, unknown> = {
+		runId: input.runId,
+		agent: input.agent,
+		task: input.task,
+		exitCode: input.result.exitCode,
+		usage: input.result.usage,
+		model: input.result.model,
+		attemptedModels: input.result.attemptedModels,
+		modelAttempts: input.result.modelAttempts,
+		durationMs: input.result.progressSummary?.durationMs,
+		toolCount: input.result.progressSummary?.toolCount,
+		error: input.result.error,
+		skills: input.result.skills,
+		skillsWarning: input.result.skillsWarning,
+		qualityGate: input.result.qualityGate,
+		timestamp: Date.now(),
+	};
+	if (Object.keys(input.qualityGateArtifacts.attempts).length > 0) {
+		metadata.qualityGateArtifacts = input.qualityGateArtifacts;
+	}
+	writeMetadata(input.result.artifactPaths.metadataPath, metadata);
+}
+
 async function runQualityGatedSync(
 	runtimeCwd: string,
 	agents: AgentConfig[],
@@ -743,6 +961,8 @@ async function runQualityGatedSync(
 	}
 
 	const gate = compiled.config;
+	const artifactEnabled = Boolean(options.artifactsDir) && options.artifactConfig?.enabled !== false;
+	const qualityGateArtifacts: QualityGateArtifactsMetadata = { attempts: {} };
 	const runs: NonNullable<SingleResult["qualityGate"]>["runs"] = [];
 	const allResults: SingleResult[] = [];
 	let lastProducer: SingleResult | undefined;
@@ -750,12 +970,30 @@ async function runQualityGatedSync(
 	let lastPass = false;
 	let attempts = 0;
 
-	const gateOptions = (extra?: Partial<RunSyncOptions>): RunSyncOptions => ({
+	const gateOptions = (
+		phase: "producer" | "validator" | "fixer",
+		attempt: number,
+		extra?: Partial<RunSyncOptions>,
+	): RunSyncOptions => ({
 		...options,
 		...extra,
 		qualityGate: false,
 		qualityGateMaxRetries: undefined,
-		onUpdate: undefined,
+		onUpdate: options.onUpdate
+			? (update) => emitQualityGateLiveUpdate({
+				onUpdate: options.onUpdate,
+				agent,
+				task,
+				index: options.index,
+				compiled,
+				runs,
+				completedResults: allResults,
+				phase,
+				attempt,
+				lastPass,
+				update,
+			})
+			: undefined,
 		outputPath: extra?.outputPath,
 	});
 
@@ -769,7 +1007,7 @@ async function runQualityGatedSync(
 			exhausted: exhausted || undefined,
 			onExhausted: gate.onExhausted,
 			attempts,
-			currentPhase: runs.at(-1)?.phase,
+			currentPhase: runs.length > 0 ? runs[runs.length - 1]?.phase : undefined,
 			validationOutput: compiled.validationOutputPath,
 			validatorOutputSchema: compiled.schemaPath,
 			lastPass,
@@ -780,6 +1018,15 @@ async function runQualityGatedSync(
 			base.exitCode = base.exitCode === 0 ? 1 : base.exitCode;
 			base.error = error ?? base.error ?? "Quality gate failed.";
 		}
+		writeQualityGateMetadata({
+			result: base,
+			runId: options.runId,
+			agent: agent.name,
+			task,
+			artifactEnabled,
+			includeMetadata: options.artifactConfig?.includeMetadata !== false,
+			qualityGateArtifacts,
+		});
 		return base;
 	};
 
@@ -800,7 +1047,7 @@ async function runQualityGatedSync(
 		const producerTask = lastValidationRaw
 			? buildRetryTask(task, compiled.validationOutputPath, summarizeValidatorArtifact(lastValidationRaw))
 			: task;
-		const producer = await runPlainSync(runtimeCwd, agents, agent.name, producerTask, gateOptions({ outputPath: options.outputPath }));
+		const producer = await runPlainSync(runtimeCwd, agents, agent.name, producerTask, gateOptions("producer", attempt, { outputPath: options.outputPath }));
 		lastProducer = producer;
 		allResults.push(producer);
 		runs.push({ phase: "producer", agent: agent.name, attempt, exitCode: producer.exitCode, error: producer.error });
@@ -823,9 +1070,24 @@ async function runQualityGatedSync(
 			schemaPath: compiled.schemaPath,
 			outputPath: options.outputPath,
 		});
-		const validator = await runPlainSync(runtimeCwd, agents, gate.validator, validatorTask, gateOptions({ outputPath: validatorOutputPath }));
+		const validator = await runPlainSync(runtimeCwd, agents, gate.validator, validatorTask, gateOptions("validator", attempt, { outputPath: validatorOutputPath }));
 		allResults.push(validator);
 		runs.push({ phase: "validator", agent: gate.validator, attempt, exitCode: validator.exitCode, validationOutput: validatorOutputPath, error: validator.error });
+		recordQualityGateArtifact(
+			qualityGateArtifacts,
+			attempt,
+			"validatorOutput",
+			snapshotQualityGateValidatorOutput({
+				artifactsDir: options.artifactsDir,
+				artifactEnabled,
+				runId: options.runId,
+				agent: agent.name,
+				attempt,
+				kind: "validator-output",
+				sourcePath: validatorOutputPath,
+				index: options.index,
+			}),
+		);
 		if (validator.exitCode !== 0) {
 			return finish(producer, false, validator.error || "Validator failed.");
 		}
@@ -857,7 +1119,22 @@ async function runQualityGatedSync(
 			validationArtifact: summarizeValidatorArtifact(artifact.raw),
 			outputPath: options.outputPath,
 		});
-		const fixer = await runPlainSync(runtimeCwd, agents, gate.fixer, fixerTask, gateOptions());
+		recordQualityGateArtifact(
+			qualityGateArtifacts,
+			attempt,
+			"fixerInput",
+			writeQualityGatePromptArtifact({
+				artifactsDir: options.artifactsDir,
+				artifactEnabled,
+				runId: options.runId,
+				agent: agent.name,
+				attempt,
+				kind: "fixer-input",
+				content: fixerTask,
+				index: options.index,
+			}),
+		);
+		const fixer = await runPlainSync(runtimeCwd, agents, gate.fixer, fixerTask, gateOptions("fixer", attempt));
 		allResults.push(fixer);
 		runs.push({ phase: "fixer", agent: gate.fixer, attempt, exitCode: fixer.exitCode, error: fixer.error });
 		if (fixer.exitCode !== 0) {
@@ -874,9 +1151,24 @@ async function runQualityGatedSync(
 			schemaPath: compiled.schemaPath,
 			outputPath: options.outputPath,
 		});
-		const postFixValidator = await runPlainSync(runtimeCwd, agents, gate.validator, postFixValidatorTask, gateOptions({ outputPath: validatorOutputPath }));
+		const postFixValidator = await runPlainSync(runtimeCwd, agents, gate.validator, postFixValidatorTask, gateOptions("validator", attempt, { outputPath: validatorOutputPath }));
 		allResults.push(postFixValidator);
 		runs.push({ phase: "validator", agent: gate.validator, attempt, exitCode: postFixValidator.exitCode, validationOutput: validatorOutputPath, error: postFixValidator.error });
+		recordQualityGateArtifact(
+			qualityGateArtifacts,
+			attempt,
+			"postFixValidatorOutput",
+			snapshotQualityGateValidatorOutput({
+				artifactsDir: options.artifactsDir,
+				artifactEnabled,
+				runId: options.runId,
+				agent: agent.name,
+				attempt,
+				kind: "validator-postfix-output",
+				sourcePath: validatorOutputPath,
+				index: options.index,
+			}),
+		);
 		if (postFixValidator.exitCode !== 0) {
 			return finish(producer, false, postFixValidator.error || "Validator failed after fixer.");
 		}

@@ -1,6 +1,7 @@
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { SubagentParamsLike } from "./subagent-executor.js";
+import { pickLiveProgressEntry } from "./slash-progress.ts";
 import {
 	SLASH_SUBAGENT_CANCEL_EVENT,
 	SLASH_SUBAGENT_REQUEST_EVENT,
@@ -120,12 +121,12 @@ export function registerSlashSubagentBridge(options: SlashBridgeOptions): {
 				controller.signal,
 				(update) => {
 					const progress = update.details?.progress;
-					const first = progress?.[0];
+					const current = pickLiveProgressEntry(progress);
 					const payload: SlashSubagentUpdate = {
 						requestId,
 						progress,
-						currentTool: first?.currentTool,
-						toolCount: first?.toolCount,
+						currentTool: current?.currentTool,
+						toolCount: current?.toolCount,
 					};
 					options.events.emit(SLASH_SUBAGENT_UPDATE_EVENT, payload);
 				},
