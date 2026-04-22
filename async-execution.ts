@@ -13,11 +13,12 @@ import type { AgentConfig } from "./agents.ts";
 import { applyThinkingSuffix } from "./pi-args.ts";
 import { injectSingleOutputInstruction, resolveSingleOutputPath } from "./single-output.ts";
 import { isParallelStep, resolveStepBehavior, type ChainStep, type SequentialStep, type StepOverrides } from "./settings.ts";
-import type { RunnerStep } from "./parallel-utils.ts";
+import type { RunnerQualityGateConfig, RunnerStep, RunnerSubagentStep } from "./parallel-utils.ts";
 import { resolvePiPackageRoot } from "./pi-spawn.ts";
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "./skills.ts";
 import { resolveChildCwd } from "./utils.ts";
 import { buildModelCandidates, resolveModelCandidate, type AvailableModelInfo } from "./model-fallback.ts";
+import { compileQualityGate } from "./quality-gate.ts";
 import {
 	type ArtifactConfig,
 	type Details,
@@ -75,12 +76,15 @@ export interface AsyncChainParams {
 	maxSubagentDepth: number;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
+	qualityGate?: boolean;
+	qualityGateMaxRetries?: number;
 }
 
 export interface AsyncSingleParams {
 	agent: string;
 	task: string;
 	agentConfig: AgentConfig;
+	agents?: AgentConfig[];
 	ctx: AsyncExecutionContext;
 	cwd?: string;
 	maxOutput?: MaxOutputConfig;
@@ -96,6 +100,8 @@ export interface AsyncSingleParams {
 	maxSubagentDepth: number;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
+	qualityGate?: boolean;
+	qualityGateMaxRetries?: number;
 }
 
 export interface AsyncExecutionResult {
@@ -213,6 +219,34 @@ export function executeAsyncChain(
 	const buildSeqStep = (s: SequentialStep, sessionFile?: string) => {
 		const a = agents.find((x) => x.name === s.agent)!;
 		const stepCwd = resolveChildCwd(runnerCwd, s.cwd);
+		const buildAgentShell = (agentConfig: AgentConfig): Omit<RunnerSubagentStep, "task" | "qualityGate"> => {
+			const skillNames = agentConfig.skills ?? [];
+			const { resolved: resolvedSkills } = resolveSkillsWithFallback(skillNames, stepCwd, ctx.cwd);
+			let systemPrompt = agentConfig.systemPrompt?.trim() ?? "";
+			if (resolvedSkills.length > 0) {
+				const injection = buildSkillInjection(resolvedSkills);
+				systemPrompt = systemPrompt ? `${systemPrompt}\n\n${injection}` : injection;
+			}
+			const primaryModel = resolveModelCandidate(agentConfig.model, availableModels, ctx.currentModelProvider);
+			return {
+				agent: agentConfig.name,
+				cwd: stepCwd,
+				model: applyThinkingSuffix(primaryModel, agentConfig.thinking),
+				modelCandidates: buildModelCandidates(agentConfig.model, agentConfig.fallbackModels, availableModels, ctx.currentModelProvider).map((candidate) =>
+					applyThinkingSuffix(candidate, agentConfig.thinking),
+				),
+				tools: agentConfig.tools,
+				extensions: agentConfig.extensions,
+				mcpDirectTools: agentConfig.mcpDirectTools,
+				systemPrompt,
+				systemPromptMode: agentConfig.systemPromptMode,
+				inheritProjectContext: agentConfig.inheritProjectContext,
+				inheritSkills: agentConfig.inheritSkills,
+				skills: resolvedSkills.map((r) => r.name),
+				maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, agentConfig.maxSubagentDepth),
+			};
+		};
+
 		const stepSkillInput = normalizeSkillInput(s.skill);
 		const stepOverrides: StepOverrides = { skills: stepSkillInput };
 		const behavior = resolveStepBehavior(a, stepOverrides, chainSkills);
@@ -229,6 +263,20 @@ export function executeAsyncChain(
 		const task = injectSingleOutputInstruction(s.task ?? "{previous}", outputPath);
 
 		const primaryModel = resolveModelCandidate(s.model ?? a.model, availableModels, ctx.currentModelProvider);
+		let qualityGate: RunnerQualityGateConfig | undefined;
+		const gateEnabled = params.qualityGate ?? a.qualityGate?.enabledByDefault;
+		if (a.qualityGate && gateEnabled !== false) {
+			const compiled = compileQualityGate({ agent: a, agents, cwd: stepCwd, runId: id, maxRetriesOverride: params.qualityGateMaxRetries });
+			const validator = agents.find((x) => x.name === compiled.config.validator)!;
+			const fixer = compiled.config.fixer ? agents.find((x) => x.name === compiled.config.fixer) : undefined;
+			qualityGate = {
+				...compiled.config,
+				enabledByDefault: true,
+				validatorOutputSchemaPath: compiled.schemaPath,
+				validatorStep: buildAgentShell(validator),
+				fixerStep: fixer ? buildAgentShell(fixer) : undefined,
+			};
+		}
 		return {
 			agent: s.agent,
 			task,
@@ -248,6 +296,7 @@ export function executeAsyncChain(
 			outputPath,
 			sessionFile,
 			maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, a.maxSubagentDepth),
+			qualityGate,
 		};
 	};
 
@@ -258,24 +307,30 @@ export function executeAsyncChain(
 		return sessionFile;
 	};
 
-	const steps: RunnerStep[] = chain.map((s) => {
-		if (isParallelStep(s)) {
-			return {
-				parallel: s.parallel.map((t) => buildSeqStep({
-					agent: t.agent,
-					task: t.task,
-					cwd: t.cwd,
-					skill: t.skill,
-					model: t.model,
-					output: t.output,
-				}, nextSessionFile())),
-				concurrency: s.concurrency,
-				failFast: s.failFast,
-				worktree: s.worktree,
-			};
-		}
-		return buildSeqStep(s as SequentialStep, nextSessionFile());
-	});
+	let steps: RunnerStep[];
+	try {
+		steps = chain.map((s) => {
+			if (isParallelStep(s)) {
+				return {
+					parallel: s.parallel.map((t) => buildSeqStep({
+						agent: t.agent,
+						task: t.task,
+						cwd: t.cwd,
+						skill: t.skill,
+						model: t.model,
+						output: t.output,
+					}, nextSessionFile())),
+					concurrency: s.concurrency,
+					failFast: s.failFast,
+					worktree: s.worktree,
+				};
+			}
+			return buildSeqStep(s as SequentialStep, nextSessionFile());
+		});
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return formatAsyncStartError("chain", `Failed to start async chain '${id}': ${message}`);
+	}
 
 	let spawnResult: { pid?: number; error?: string } = {};
 	try {
@@ -389,6 +444,53 @@ export function executeAsyncSingle(
 
 	const outputPath = resolveSingleOutputPath(params.output, ctx.cwd, runnerCwd);
 	const taskWithOutputInstruction = injectSingleOutputInstruction(task, outputPath);
+	const allAgents = params.agents ?? [agentConfig];
+	const buildAgentShell = (agentConfig: AgentConfig): Omit<RunnerSubagentStep, "task" | "qualityGate"> => {
+		const shellSkillNames = agentConfig.skills ?? [];
+		const { resolved: shellSkills } = resolveSkillsWithFallback(shellSkillNames, runnerCwd, ctx.cwd);
+		let shellSystemPrompt = agentConfig.systemPrompt?.trim() ?? "";
+		if (shellSkills.length > 0) {
+			const injection = buildSkillInjection(shellSkills);
+			shellSystemPrompt = shellSystemPrompt ? `${shellSystemPrompt}\n\n${injection}` : injection;
+		}
+		const primaryModel = resolveModelCandidate(agentConfig.model, availableModels, ctx.currentModelProvider);
+		return {
+			agent: agentConfig.name,
+			cwd: runnerCwd,
+			model: applyThinkingSuffix(primaryModel, agentConfig.thinking),
+			modelCandidates: buildModelCandidates(agentConfig.model, agentConfig.fallbackModels, availableModels, ctx.currentModelProvider).map((candidate) =>
+				applyThinkingSuffix(candidate, agentConfig.thinking),
+			),
+			tools: agentConfig.tools,
+			extensions: agentConfig.extensions,
+			mcpDirectTools: agentConfig.mcpDirectTools,
+			systemPrompt: shellSystemPrompt,
+			systemPromptMode: agentConfig.systemPromptMode,
+			inheritProjectContext: agentConfig.inheritProjectContext,
+			inheritSkills: agentConfig.inheritSkills,
+			skills: shellSkills.map((r) => r.name),
+			maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, agentConfig.maxSubagentDepth),
+		};
+	};
+	let qualityGate: RunnerQualityGateConfig | undefined;
+	try {
+		const gateEnabled = params.qualityGate ?? agentConfig.qualityGate?.enabledByDefault;
+		if (agentConfig.qualityGate && gateEnabled !== false) {
+			const compiled = compileQualityGate({ agent: agentConfig, agents: allAgents, cwd: runnerCwd, runId: id, maxRetriesOverride: params.qualityGateMaxRetries });
+			const validator = allAgents.find((x) => x.name === compiled.config.validator)!;
+			const fixer = compiled.config.fixer ? allAgents.find((x) => x.name === compiled.config.fixer) : undefined;
+			qualityGate = {
+				...compiled.config,
+				enabledByDefault: true,
+				validatorOutputSchemaPath: compiled.schemaPath,
+				validatorStep: buildAgentShell(validator),
+				fixerStep: fixer ? buildAgentShell(fixer) : undefined,
+			};
+		}
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return formatAsyncStartError("single", `Failed to start async run '${id}': ${message}`);
+	}
 	let spawnResult: { pid?: number; error?: string } = {};
 	try {
 		spawnResult = spawnRunner(
@@ -414,6 +516,7 @@ export function executeAsyncSingle(
 						outputPath,
 						sessionFile,
 						maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, agentConfig.maxSubagentDepth),
+						qualityGate,
 					},
 				],
 				resultPath: path.join(RESULTS_DIR, `${id}.json`),

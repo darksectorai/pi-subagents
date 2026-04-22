@@ -11,6 +11,7 @@ import {
 	type ArtifactConfig,
 	type ArtifactPaths,
 	type ModelAttempt,
+	type QualityGateResult,
 	type Usage,
 	DEFAULT_MAX_OUTPUT,
 	type MaxOutputConfig,
@@ -30,6 +31,12 @@ import { buildPiArgs, cleanupTempDir } from "./pi-args.ts";
 import { formatModelAttemptNote, isRetryableModelFailure } from "./model-fallback.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "./post-exit-stdio-guard.ts";
 import { detectSubagentError, extractTextFromContent, extractToolArgsPreview, getFinalOutput } from "./utils.ts";
+import {
+	loadValidatorSchema,
+	readValidatorArtifact,
+	resolveQualityGateOutputPath,
+	summarizeValidatorArtifact,
+} from "./quality-gate.ts";
 import { parseSessionTokens, type TokenUsage } from "./session-tokens.ts";
 import {
 	cleanupWorktrees,
@@ -72,6 +79,7 @@ interface StepResult {
 	modelAttempts?: ModelAttempt[];
 	artifactPaths?: ArtifactPaths;
 	truncated?: boolean;
+	qualityGate?: QualityGateResult;
 }
 
 const require = createRequire(import.meta.url);
@@ -481,10 +489,11 @@ interface SingleStepContext {
 	outputFile: string;
 	piPackageRoot?: string;
 	piArgv1?: string;
+	onQualityGateUpdate?: (qualityGate: QualityGateResult) => void;
 }
 
 /** Run a single pi agent step, returning output and metadata */
-async function runSingleStep(
+async function runPlainSingleStep(
 	step: SubagentStep,
 	ctx: SingleStepContext,
 ): Promise<{
@@ -496,6 +505,7 @@ async function runSingleStep(
 	attemptedModels?: string[];
 	modelAttempts?: ModelAttempt[];
 	artifactPaths?: ArtifactPaths;
+	qualityGate?: QualityGateResult;
 }> {
 	const placeholderRegex = new RegExp(ctx.placeholder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
 	const task = step.task.replace(placeholderRegex, () => ctx.previousOutput);
@@ -630,6 +640,289 @@ async function runSingleStep(
 	};
 }
 
+function gateOutputFile(base: string, phase: string, attempt: number): string {
+	const ext = path.extname(base);
+	const stem = ext ? base.slice(0, -ext.length) : base;
+	return `${stem}-${phase}-${attempt}${ext || ".log"}`;
+}
+
+function buildRunnerValidatorTask(input: {
+	agentName: string;
+	originalTask: string;
+	producerOutput: string;
+	validationOutputPath: string;
+	passField: string;
+	schemaPath?: string;
+	outputPath?: string;
+}): string {
+	return [
+		`Validate the output from agent '${input.agentName}'.`,
+		"",
+		"Original task:",
+		input.originalTask,
+		"",
+		"Producer output:",
+		input.producerOutput || "(no textual output)",
+		input.outputPath ? `Primary output file: ${input.outputPath}` : undefined,
+		"",
+		`Write a JSON object to: ${input.validationOutputPath}`,
+		`The JSON object must contain boolean field '${input.passField}'.`,
+		input.schemaPath ? `It must also conform to JSON Schema: ${input.schemaPath}` : undefined,
+		"Do not write markdown fences around the JSON artifact.",
+	].filter((line): line is string => line !== undefined).join("\n");
+}
+
+function buildRunnerFixerTask(input: {
+	agentName: string;
+	originalTask: string;
+	producerOutput: string;
+	validationOutputPath: string;
+	validationArtifact: string;
+	outputPath?: string;
+}): string {
+	return [
+		`Fix the output from agent '${input.agentName}' so it passes validation.`,
+		"",
+		"Original task:",
+		input.originalTask,
+		"",
+		"Current output:",
+		input.producerOutput || "(no textual output)",
+		"",
+		`Validator artifact: ${input.validationOutputPath}`,
+		input.validationArtifact || "(empty validator artifact)",
+		input.outputPath ? `Update the primary output file in place: ${input.outputPath}` : undefined,
+	].filter((line): line is string => line !== undefined).join("\n");
+}
+
+function buildRunnerRetryTask(originalTask: string, validationOutputPath: string, validationArtifact: string): string {
+	return [
+		originalTask,
+		"",
+		"Previous quality-gate validation did not pass. Produce a corrected result.",
+		`Validator artifact: ${validationOutputPath}`,
+		validationArtifact || "(empty validator artifact)",
+	].join("\n");
+}
+
+function refreshRunnerOutputFromFile(
+	result: Awaited<ReturnType<typeof runPlainSingleStep>>,
+	outputPath: string | undefined,
+): void {
+	if (!outputPath) return;
+	try {
+		if (!fs.existsSync(outputPath)) return;
+		result.output = fs.readFileSync(outputPath, "utf-8");
+	} catch {
+		// Output refresh is best-effort; the validation result carries the actual failure if any.
+	}
+}
+
+async function runSingleStep(
+	step: SubagentStep,
+	ctx: SingleStepContext,
+): Promise<Awaited<ReturnType<typeof runPlainSingleStep>>> {
+	const gate = step.qualityGate;
+	if (!gate || gate.enabledByDefault === false) {
+		return runPlainSingleStep(step, ctx);
+	}
+
+	const originalTask = step.task;
+	const runs: QualityGateResult["runs"] = [];
+	let attempts = 0;
+	let lastPass = false;
+	let lastValidationRaw = "";
+	let lastProducer: Awaited<ReturnType<typeof runPlainSingleStep>> | undefined;
+	const validateSchema = gate.validatorOutputSchemaPath
+		? loadValidatorSchema(gate.validatorOutputSchemaPath)
+		: undefined;
+	const validationOutputPath = resolveQualityGateOutputPath(gate.validationOutput, step.cwd ?? ctx.cwd, {
+		runId: ctx.id,
+		agent: step.agent,
+		attempt: 1,
+		phase: "validator",
+	});
+
+	const emitGate = (passed: boolean, error?: string, exhausted = false): QualityGateResult => {
+		const result: QualityGateResult = {
+			enabled: true,
+			passed,
+			exhausted: exhausted || undefined,
+			onExhausted: gate.onExhausted,
+			attempts,
+			currentPhase: runs.at(-1)?.phase,
+			validationOutput: validationOutputPath,
+			validatorOutputSchema: gate.validatorOutputSchemaPath,
+			lastPass,
+			error,
+			runs: runs.map((run) => ({ ...run })),
+		};
+		ctx.onQualityGateUpdate?.(result);
+		return result;
+	};
+
+	if (gate.maxRetries === 0) {
+		const qualityGate = emitGate(false, "Quality gate exhausted before running because maxRetries is 0.", true);
+		return {
+			agent: step.agent,
+			output: qualityGate.error ?? "Quality gate failed.",
+			exitCode: gate.onExhausted === "continue" ? 0 : 1,
+			error: gate.onExhausted === "continue" ? undefined : qualityGate.error,
+			qualityGate,
+		};
+	}
+
+	for (let attempt = 1; attempt <= gate.maxRetries; attempt++) {
+		attempts = attempt;
+		emitGate(false);
+		const producerTask = lastValidationRaw
+			? buildRunnerRetryTask(originalTask, validationOutputPath, summarizeValidatorArtifact(lastValidationRaw))
+			: originalTask;
+		const producer = await runPlainSingleStep({ ...step, task: producerTask, qualityGate: undefined }, {
+			...ctx,
+			outputFile: gateOutputFile(ctx.outputFile, "producer", attempt),
+		});
+		lastProducer = producer;
+		runs.push({ phase: "producer", agent: step.agent, attempt, exitCode: producer.exitCode ?? 1, error: producer.error });
+		if (producer.exitCode !== 0) {
+			producer.qualityGate = emitGate(false, producer.error || "Producer failed.");
+			return producer;
+		}
+
+		const attemptValidationOutputPath = resolveQualityGateOutputPath(gate.validationOutput, step.cwd ?? ctx.cwd, {
+			runId: ctx.id,
+			agent: step.agent,
+			attempt,
+			phase: "validator",
+		});
+		const validatorTask = buildRunnerValidatorTask({
+			agentName: step.agent,
+			originalTask,
+			producerOutput: producer.output,
+			validationOutputPath: attemptValidationOutputPath,
+			passField: gate.passField,
+			schemaPath: gate.validatorOutputSchemaPath,
+			outputPath: step.outputPath,
+		});
+		const validator = await runPlainSingleStep({ ...gate.validatorStep, task: validatorTask, outputPath: attemptValidationOutputPath }, {
+			...ctx,
+			outputFile: gateOutputFile(ctx.outputFile, "validator", attempt),
+		});
+		runs.push({ phase: "validator", agent: gate.validator, attempt, exitCode: validator.exitCode ?? 1, validationOutput: attemptValidationOutputPath, error: validator.error });
+		if (validator.exitCode !== 0) {
+			producer.qualityGate = emitGate(false, validator.error || "Validator failed.");
+			producer.exitCode = producer.exitCode === 0 ? 1 : producer.exitCode;
+			producer.error = producer.qualityGate.error;
+			return producer;
+		}
+
+		let artifact;
+		try {
+			artifact = readValidatorArtifact(attemptValidationOutputPath, gate.passField, validateSchema);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			runs[runs.length - 1]!.error = message;
+			producer.qualityGate = emitGate(false, message);
+			producer.exitCode = 1;
+			producer.error = message;
+			return producer;
+		}
+		lastValidationRaw = artifact.raw;
+		lastPass = artifact.pass;
+		runs[runs.length - 1]!.pass = artifact.pass;
+		if (artifact.pass) {
+			producer.qualityGate = emitGate(true);
+			return producer;
+		}
+
+		if (!gate.fixerStep || !gate.fixer) {
+			const message = "Quality gate did not pass and no fixer is configured.";
+			if (attempt === gate.maxRetries) {
+				producer.qualityGate = emitGate(false, message, true);
+				if (gate.onExhausted !== "continue") {
+					producer.exitCode = 1;
+					producer.error = message;
+				}
+				return producer;
+			}
+			continue;
+		}
+
+		const fixerTask = buildRunnerFixerTask({
+			agentName: step.agent,
+			originalTask,
+			producerOutput: producer.output,
+			validationOutputPath: attemptValidationOutputPath,
+			validationArtifact: summarizeValidatorArtifact(artifact.raw),
+			outputPath: step.outputPath,
+		});
+		const fixer = await runPlainSingleStep({ ...gate.fixerStep, task: fixerTask }, {
+			...ctx,
+			outputFile: gateOutputFile(ctx.outputFile, "fixer", attempt),
+		});
+		runs.push({ phase: "fixer", agent: gate.fixer, attempt, exitCode: fixer.exitCode ?? 1, error: fixer.error });
+		if (fixer.exitCode !== 0) {
+			producer.qualityGate = emitGate(false, fixer.error || "Fixer failed.");
+			producer.exitCode = 1;
+			producer.error = producer.qualityGate.error;
+			return producer;
+		}
+
+		refreshRunnerOutputFromFile(producer, step.outputPath);
+		const postFixValidatorTask = buildRunnerValidatorTask({
+			agentName: step.agent,
+			originalTask,
+			producerOutput: producer.output,
+			validationOutputPath: attemptValidationOutputPath,
+			passField: gate.passField,
+			schemaPath: gate.validatorOutputSchemaPath,
+			outputPath: step.outputPath,
+		});
+		const postFixValidator = await runPlainSingleStep({ ...gate.validatorStep, task: postFixValidatorTask, outputPath: attemptValidationOutputPath }, {
+			...ctx,
+			outputFile: gateOutputFile(ctx.outputFile, "validator-fixed", attempt),
+		});
+		runs.push({ phase: "validator", agent: gate.validator, attempt, exitCode: postFixValidator.exitCode ?? 1, validationOutput: attemptValidationOutputPath, error: postFixValidator.error });
+		if (postFixValidator.exitCode !== 0) {
+			producer.qualityGate = emitGate(false, postFixValidator.error || "Validator failed after fixer.");
+			producer.exitCode = 1;
+			producer.error = producer.qualityGate.error;
+			return producer;
+		}
+		try {
+			artifact = readValidatorArtifact(attemptValidationOutputPath, gate.passField, validateSchema);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			runs[runs.length - 1]!.error = message;
+			producer.qualityGate = emitGate(false, message);
+			producer.exitCode = 1;
+			producer.error = message;
+			return producer;
+		}
+		lastValidationRaw = artifact.raw;
+		lastPass = artifact.pass;
+		runs[runs.length - 1]!.pass = artifact.pass;
+		if (artifact.pass) {
+			producer.qualityGate = emitGate(true);
+			return producer;
+		}
+	}
+
+	const message = `Quality gate exhausted after ${gate.maxRetries} attempt${gate.maxRetries === 1 ? "" : "s"}. Last ${gate.passField}=false.`;
+	const base = lastProducer ?? {
+		agent: step.agent,
+		output: message,
+		exitCode: 1,
+		error: message,
+	};
+	base.qualityGate = emitGate(false, message, true);
+	if (gate.onExhausted !== "continue") {
+		base.exitCode = 1;
+		base.error = message;
+	}
+	return base;
+}
+
 type RunnerStatusPayload = {
 	runId: string;
 	mode: "single" | "chain";
@@ -653,6 +946,7 @@ type RunnerStatusPayload = {
 		attemptedModels?: string[];
 		modelAttempts?: ModelAttempt[];
 		error?: string;
+		qualityGate?: QualityGateResult;
 	}>;
 	artifactsDir?: string;
 	sessionDir?: string;
@@ -912,6 +1206,11 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							outputFile: path.join(asyncDir, `output-${fi}.log`),
 							piPackageRoot: config.piPackageRoot,
 							piArgv1: config.piArgv1,
+							onQualityGateUpdate: (qualityGate) => {
+								statusPayload.steps[fi].qualityGate = qualityGate;
+								statusPayload.lastUpdate = Date.now();
+								writeJson(statusPath, statusPayload);
+							},
 						});
 						if (task.sessionFile) {
 							latestSessionFile = task.sessionFile;
@@ -928,6 +1227,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						statusPayload.steps[fi].attemptedModels = singleResult.attemptedModels;
 						statusPayload.steps[fi].modelAttempts = singleResult.modelAttempts;
 						statusPayload.steps[fi].error = singleResult.error;
+						statusPayload.steps[fi].qualityGate = singleResult.qualityGate;
 						statusPayload.lastUpdate = taskEndTime;
 						writeJson(statusPath, statusPayload);
 
@@ -973,6 +1273,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						attemptedModels: pr.attemptedModels,
 						modelAttempts: pr.modelAttempts,
 						artifactPaths: pr.artifactPaths,
+						qualityGate: pr.qualityGate,
 					});
 				}
 
@@ -1029,6 +1330,11 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				outputFile: path.join(asyncDir, `output-${flatIndex}.log`),
 				piPackageRoot: config.piPackageRoot,
 				piArgv1: config.piArgv1,
+				onQualityGateUpdate: (qualityGate) => {
+					statusPayload.steps[flatIndex].qualityGate = qualityGate;
+					statusPayload.lastUpdate = Date.now();
+					writeJson(statusPath, statusPayload);
+				},
 			});
 			if (seqStep.sessionFile) {
 				latestSessionFile = seqStep.sessionFile;
@@ -1043,6 +1349,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				attemptedModels: singleResult.attemptedModels,
 				modelAttempts: singleResult.modelAttempts,
 				artifactPaths: singleResult.artifactPaths,
+				qualityGate: singleResult.qualityGate,
 			});
 
 			const cumulativeTokens = config.sessionDir ? parseSessionTokens(config.sessionDir) : null;
@@ -1066,6 +1373,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			statusPayload.steps[flatIndex].attemptedModels = singleResult.attemptedModels;
 			statusPayload.steps[flatIndex].modelAttempts = singleResult.modelAttempts;
 			statusPayload.steps[flatIndex].error = singleResult.error;
+			statusPayload.steps[flatIndex].qualityGate = singleResult.qualityGate;
 			if (stepTokens) {
 				statusPayload.steps[flatIndex].tokens = stepTokens;
 				statusPayload.totalTokens = { ...previousCumulativeTokens };
@@ -1198,6 +1506,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				modelAttempts: r.modelAttempts,
 				artifactPaths: r.artifactPaths,
 				truncated: r.truncated,
+				qualityGate: r.qualityGate,
 			})),
 			exitCode: results.every((r) => r.success) ? 0 : 1,
 			timestamp: runEndedAt,

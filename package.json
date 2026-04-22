@@ -30,6 +30,7 @@
     "!*.test.ts",
     "*.mjs",
     "agents/",
+    "schemas/",
     "README.md",
     "CHANGELOG.md"
   ],
@@ -52,6 +53,9 @@
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*",
     "@sinclair/typebox": "*"
+  },
+  "dependencies": {
+    "ajv": "^8.18.0"
   },
   "devDependencies": {
     "@marcfargas/pi-test-harness": "^0.5.0",

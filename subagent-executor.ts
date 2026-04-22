@@ -85,6 +85,8 @@ export interface SubagentParamsLike {
 	output?: string | boolean;
 	agentScope?: unknown;
 	chainDir?: string;
+	qualityGate?: boolean;
+	qualityGateMaxRetries?: number;
 }
 
 interface ExecutorDeps {
@@ -429,6 +431,8 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			maxSubagentDepth: currentMaxSubagentDepth,
 			worktreeSetupHook: deps.config.worktreeSetupHook,
 			worktreeSetupHookTimeoutMs: deps.config.worktreeSetupHookTimeoutMs,
+			qualityGate: params.qualityGate,
+			qualityGateMaxRetries: params.qualityGateMaxRetries,
 		});
 	}
 
@@ -452,6 +456,8 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			maxSubagentDepth: currentMaxSubagentDepth,
 			worktreeSetupHook: deps.config.worktreeSetupHook,
 			worktreeSetupHookTimeoutMs: deps.config.worktreeSetupHookTimeoutMs,
+			qualityGate: params.qualityGate,
+			qualityGateMaxRetries: params.qualityGateMaxRetries,
 		});
 	}
 
@@ -474,6 +480,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			agent: params.agent!,
 			task: params.context === "fork" ? wrapForkTask(params.task!) : params.task!,
 			agentConfig: a,
+			agents,
 			ctx: asyncCtx,
 			availableModels,
 			cwd: effectiveCwd,
@@ -489,6 +496,8 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			maxSubagentDepth,
 			worktreeSetupHook: deps.config.worktreeSetupHook,
 			worktreeSetupHookTimeoutMs: deps.config.worktreeSetupHookTimeoutMs,
+			qualityGate: params.qualityGate,
+			qualityGateMaxRetries: params.qualityGateMaxRetries,
 		});
 	}
 
@@ -536,6 +545,8 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		maxSubagentDepth: currentMaxSubagentDepth,
 		worktreeSetupHook: deps.config.worktreeSetupHook,
 		worktreeSetupHookTimeoutMs: deps.config.worktreeSetupHookTimeoutMs,
+		qualityGate: params.qualityGate,
+		qualityGateMaxRetries: params.qualityGateMaxRetries,
 	});
 
 	if (chainResult.requestedAsync) {
@@ -604,6 +615,8 @@ interface ForegroundParallelRunInput {
 	liveProgress: (AgentProgress | undefined)[];
 	onUpdate?: (r: AgentToolResult<Details>) => void;
 	worktreeSetup?: WorktreeSetup;
+	qualityGate?: boolean;
+	qualityGateMaxRetries?: number;
 }
 
 function buildParallelModeError(message: string): AgentToolResult<Details> {
@@ -703,6 +716,8 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			availableModels: input.availableModels,
 			preferredModelProvider: input.ctx.model?.provider,
 			skills: effectiveSkills === false ? [] : effectiveSkills,
+			qualityGate: input.qualityGate,
+			qualityGateMaxRetries: input.qualityGateMaxRetries,
 			onUpdate: input.onUpdate
 				? (progressUpdate) => {
 						const stepResults = progressUpdate.details?.results || [];
@@ -914,6 +929,8 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			liveProgress,
 			onUpdate,
 			worktreeSetup,
+			qualityGate: params.qualityGate,
+			qualityGateMaxRetries: params.qualityGateMaxRetries,
 		});
 		for (let i = 0; i < results.length; i++) {
 			const run = results[i]!;
@@ -1053,6 +1070,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				agent: params.agent!,
 				task: params.context === "fork" ? wrapForkTask(task) : task,
 				agentConfig,
+				agents,
 				ctx: asyncCtx,
 				availableModels,
 				cwd: effectiveCwd,
@@ -1068,6 +1086,8 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				maxSubagentDepth,
 				worktreeSetupHook: deps.config.worktreeSetupHook,
 				worktreeSetupHookTimeoutMs: deps.config.worktreeSetupHookTimeoutMs,
+				qualityGate: params.qualityGate,
+				qualityGateMaxRetries: params.qualityGateMaxRetries,
 			});
 		}
 	}
@@ -1105,6 +1125,8 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		availableModels,
 		preferredModelProvider: currentProvider,
 		skills: effectiveSkills,
+		qualityGate: params.qualityGate,
+		qualityGateMaxRetries: params.qualityGateMaxRetries,
 	});
 	recordRun(params.agent!, cleanTask, r.exitCode, r.progressSummary?.durationMs ?? 0);
 

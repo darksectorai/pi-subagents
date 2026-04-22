@@ -10,6 +10,7 @@ import { KNOWN_FIELDS } from "./agent-serializer.ts";
 import { parseChain } from "./chain-serializer.ts";
 import { mergeAgentsForScope } from "./agent-selection.ts";
 import { parseFrontmatter } from "./frontmatter.ts";
+import type { QualityGateConfig } from "./types.ts";
 
 export type AgentScope = "user" | "project" | "both";
 
@@ -83,6 +84,8 @@ export interface AgentConfig {
 	interactive?: boolean;
 	maxSubagentDepth?: number;
 	disabled?: boolean;
+	qualityGate?: QualityGateConfig;
+	schemaSearchDirs?: string[];
 	extraFields?: Record<string, string>;
 	override?: BuiltinAgentOverrideInfo;
 }
@@ -355,6 +358,38 @@ function readSubagentSettings(filePath: string | null): SubagentSettings {
 	return { overrides: parsed, disableBuiltins };
 }
 
+function parseBooleanField(raw: string | undefined, defaultValue: boolean): boolean {
+	if (raw === "true") return true;
+	if (raw === "false") return false;
+	return defaultValue;
+}
+
+function parseQualityGate(frontmatter: Record<string, string>): QualityGateConfig | undefined {
+	const hasBlock = frontmatter.qualityGate !== undefined
+		|| Object.keys(frontmatter).some((key) => key.startsWith("qualityGate."));
+	if (!hasBlock) return undefined;
+	if (frontmatter.qualityGate === "false") return undefined;
+
+	const field = (name: string): string | undefined => {
+		const raw = frontmatter[`qualityGate.${name}`];
+		return raw && raw.trim() ? raw.trim() : undefined;
+	};
+	const validator = field("validator");
+	const validationOutput = field("validationOutput");
+	const parsedRetries = Number(field("maxRetries") ?? "1");
+
+	return {
+		validator: validator ?? "",
+		fixer: field("fixer"),
+		validationOutput: validationOutput ?? "",
+		passField: field("passField") ?? "pass",
+		maxRetries: Number.isInteger(parsedRetries) ? parsedRetries : Number.NaN,
+		enabledByDefault: parseBooleanField(field("enabledByDefault"), true),
+		validatorOutputSchema: field("validatorOutputSchema"),
+		onExhausted: field("onExhausted") === "continue" ? "continue" : "stop",
+	};
+}
+
 function applyBuiltinOverride(
 	agent: AgentConfig,
 	override: BuiltinAgentOverrideConfig,
@@ -583,6 +618,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 		}
 
 		const parsedMaxSubagentDepth = Number(frontmatter.maxSubagentDepth);
+		const qualityGate = parseQualityGate(frontmatter);
 
 		agents.push({
 			name: frontmatter.name,
@@ -608,6 +644,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 				Number.isInteger(parsedMaxSubagentDepth) && parsedMaxSubagentDepth >= 0
 					? parsedMaxSubagentDepth
 					: undefined,
+			qualityGate,
 			extraFields: Object.keys(extraFields).length > 0 ? extraFields : undefined,
 		});
 	}
@@ -659,6 +696,26 @@ function isDirectory(p: string): boolean {
 	}
 }
 
+function uniqExistingDirs(dirs: Array<string | undefined>): string[] {
+	const seen = new Set<string>();
+	const result: string[] = [];
+	for (const dir of dirs) {
+		if (!dir || seen.has(dir) || !isDirectory(dir)) continue;
+		seen.add(dir);
+		result.push(dir);
+	}
+	return result;
+}
+
+function schemaDirForAgentDir(dir: string, source: AgentSource): string {
+	if (source === "user") {
+		return path.join(os.homedir(), ".pi", "agent", "schemas");
+	}
+	const base = path.basename(dir);
+	if (base === "agents") return path.join(path.dirname(dir), "schemas");
+	return path.join(path.dirname(dir), ".schemas");
+}
+
 function resolveNearestProjectAgentDirs(cwd: string): { readDirs: string[]; preferredDir: string | null } {
 	const projectRoot = findNearestProjectRoot(cwd);
 	if (!projectRoot) return { readDirs: [], preferredDir: null };
@@ -680,6 +737,12 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 	const userDirOld = path.join(os.homedir(), ".pi", "agent", "agents");
 	const userDirNew = path.join(os.homedir(), ".agents");
 	const { readDirs: projectAgentDirs, preferredDir: projectAgentsDir } = resolveNearestProjectAgentDirs(cwd);
+	const schemaSearchDirs = uniqExistingDirs([
+		...projectAgentDirs.map((dir) => schemaDirForAgentDir(dir, "project")),
+		schemaDirForAgentDir(userDirOld, "user"),
+		schemaDirForAgentDir(userDirNew, "user"),
+		schemaDirForAgentDir(BUILTIN_AGENTS_DIR, "builtin"),
+	]);
 	const userSettingsPath = getUserAgentSettingsPath();
 	const projectSettingsPath = getProjectAgentSettingsPath(cwd);
 	const userSettings = scope === "project" ? EMPTY_SUBAGENT_SETTINGS : readSubagentSettings(userSettingsPath);
@@ -699,7 +762,8 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 
 	const projectAgents = scope === "user" ? [] : projectAgentDirs.flatMap((dir) => loadAgentsFromDir(dir, "project"));
 	const agents = mergeAgentsForScope(scope, userAgents, projectAgents, builtinAgents)
-		.filter((agent) => agent.disabled !== true);
+		.filter((agent) => agent.disabled !== true)
+		.map((agent) => ({ ...agent, schemaSearchDirs }));
 
 	return { agents, projectAgentsDir };
 }
@@ -717,6 +781,12 @@ export function discoverAgentsAll(cwd: string): {
 	const userDirOld = path.join(os.homedir(), ".pi", "agent", "agents");
 	const userDirNew = path.join(os.homedir(), ".agents");
 	const { readDirs: projectDirs, preferredDir: projectDir } = resolveNearestProjectAgentDirs(cwd);
+	const schemaSearchDirs = uniqExistingDirs([
+		...projectDirs.map((dir) => schemaDirForAgentDir(dir, "project")),
+		schemaDirForAgentDir(userDirOld, "user"),
+		schemaDirForAgentDir(userDirNew, "user"),
+		schemaDirForAgentDir(BUILTIN_AGENTS_DIR, "builtin"),
+	]);
 	const userSettingsPath = getUserAgentSettingsPath();
 	const projectSettingsPath = getProjectAgentSettingsPath(cwd);
 	const userSettings = readSubagentSettings(userSettingsPath);
@@ -728,18 +798,18 @@ export function discoverAgentsAll(cwd: string): {
 		projectSettings,
 		userSettingsPath,
 		projectSettingsPath,
-	);
+	).map((agent) => ({ ...agent, schemaSearchDirs }));
 	const user = [
 		...loadAgentsFromDir(userDirOld, "user"),
 		...loadAgentsFromDir(userDirNew, "user"),
-	];
+	].map((agent) => ({ ...agent, schemaSearchDirs }));
 	const projectMap = new Map<string, AgentConfig>();
 	for (const dir of projectDirs) {
 		for (const agent of loadAgentsFromDir(dir, "project")) {
 			projectMap.set(agent.name, agent);
 		}
 	}
-	const project = Array.from(projectMap.values());
+	const project = Array.from(projectMap.values()).map((agent) => ({ ...agent, schemaSearchDirs }));
 
 	const chainMap = new Map<string, ChainConfig>();
 	for (const dir of projectDirs) {

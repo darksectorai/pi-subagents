@@ -113,6 +113,15 @@ defaultReads: context.md     # comma-separated files to read
 defaultProgress: true        # maintain progress.md
 interactive: true            # (parsed but not enforced in v1)
 maxSubagentDepth: 1          # tighten nested delegation for this agent's children
+qualityGate:                 # optional validation/fix retry policy
+  validator: quality-example-validator
+  fixer: quality-example-fixer
+  validationOutput: .pi-quality/worker-validation.json
+  passField: pass            # defaults to pass
+  maxRetries: 2              # producer attempts
+  enabledByDefault: true     # defaults to true
+  validatorOutputSchema: worker-validation.schema.json
+  onExhausted: stop          # stop or continue
 ---
 
 Your system prompt goes here (the markdown body after frontmatter).
@@ -121,6 +130,55 @@ Your system prompt goes here (the markdown body after frontmatter).
 The `thinking` field sets a default extended thinking level for the agent. At runtime it's appended as a `:level` suffix to the model string (e.g., `claude-sonnet-4-5:high`). If the model already has a thinking suffix (from a chain-clarify override), the agent's default is not double-applied.
 
 `fallbackModels` is an optional ordered list of backup models to try when the primary model fails with a provider/model-style error such as quota, auth, timeout, or provider/model unavailable. In markdown frontmatter, declare it as a comma-separated string. In management `config` objects, you can pass either a comma-separated string or a string array.
+
+`qualityGate` is an optional agent-level execution policy. Agents without it run exactly as before. Agents with it run a validation loop:
+
+```text
+producer -> validator -> fixer when needed -> validator
+```
+
+The validator must write a JSON object to `validationOutput`, and that object must contain a boolean pass field. The default field name is `pass`; set `passField` only when you need a different name. If `validatorOutputSchema` is set, the validator artifact is also checked with Ajv before the pass field is trusted. Schema names are resolved from schema directories that mirror agent discovery priority:
+
+| Scope | Schema path |
+|-------|-------------|
+| Builtin | extension `schemas/` directory |
+| User | `~/.pi/agent/schemas/` |
+| Project | `.pi/schemas/` |
+
+Project schemas win over user schemas, and user schemas win over builtin schemas. `validatorOutputSchema` is a schema name resolved through those roots, not a free-form output path.
+
+`maxRetries` is the maximum number of producer attempts. Each attempt can run the producer once, the validator once, the fixer once if validation fails, and the validator once more. Validator execution failure, malformed JSON, schema failure, a missing/non-boolean pass field, producer failure, or fixer failure is a hard failure. A clean `pass: false` is retryable until attempts are exhausted. `onExhausted: continue` lets the run continue after retry exhaustion; it does not convert hard failures into success.
+
+You can override gate behavior per run with tool parameters:
+
+- `qualityGate: false` disables configured gates for that run.
+- `qualityGate: true` forces a configured gate on even if `enabledByDefault: false`.
+- `qualityGateMaxRetries: 0` or higher overrides the agent's configured attempt count.
+
+Minimal producer example:
+
+```yaml
+---
+name: extractor
+description: Extract data and require validation
+qualityGate:
+  validator: extraction-validator
+  fixer: extraction-fixer
+  validationOutput: .pi-quality/extraction-validation.json
+  maxRetries: 2
+---
+```
+
+Minimal validator artifact:
+
+```json
+{
+  "pass": false,
+  "issues": ["missing required field: title"]
+}
+```
+
+The bundled `quality-example-producer`, `quality-example-validator`, and `quality-example-fixer` agents show the contract without changing the existing builtin agents.
 
 `systemPromptMode` — How the agent markdown body is passed to Pi:
 - **`replace`** (default) — The agent's markdown body becomes the system prompt. Clean slate, no Pi base prompt baggage.

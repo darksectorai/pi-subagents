@@ -170,7 +170,10 @@ export class SubagentsStatusComponent implements Component {
 				: "";
 			const duration = step.durationMs !== undefined ? ` | ${formatDuration(step.durationMs)}` : "";
 			const tokens = step.tokens ? ` | ${formatTokens(step.tokens.total)} tok` : "";
-			const line = `  ${step.index + 1}. ${step.agent} | ${stepStatusColor(this.theme, step.status)}${model}${attempts}${duration}${tokens}`;
+			const gate = step.qualityGate
+				? ` | gate ${step.qualityGate.passed ? "passed" : step.qualityGate.exhausted ? "exhausted" : "running"} (${step.qualityGate.attempts})`
+				: "";
+			const line = `  ${step.index + 1}. ${step.agent} | ${stepStatusColor(this.theme, step.status)}${model}${attempts}${duration}${tokens}${gate}`;
 			lines.push(row(truncateToWidth(line, innerW), width, this.theme));
 			if (step.error) {
 				lines.push(row(truncateToWidth(`     ${step.error}`, innerW), width, this.theme));

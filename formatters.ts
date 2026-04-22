@@ -63,17 +63,25 @@ export function buildChainSummary(
 		if (r.skills) r.skills.forEach((s) => allSkills.add(s));
 	}
 	const skillsLine = allSkills.size > 0 ? `🔧 Skills: ${[...allSkills].join(", ")}` : "";
+	const gated = results
+		.filter((result) => result.qualityGate)
+		.map((result) => {
+			const gate = result.qualityGate!;
+			const verdict = gate.passed ? "passed" : gate.exhausted ? "exhausted" : "failed";
+			return `${result.agent}:${verdict}/${gate.attempts}`;
+		});
+	const gateLine = gated.length > 0 ? `Quality gates: ${gated.join(", ")}` : "";
 
 	if (status === "completed") {
 		const stepWord = results.length === 1 ? "step" : "steps";
-		return `✅ Chain completed: ${stepNames} (${results.length} ${stepWord}, ${durationStr})${skillsLine ? `\n${skillsLine}` : ""}
+		return `✅ Chain completed: ${stepNames} (${results.length} ${stepWord}, ${durationStr})${skillsLine ? `\n${skillsLine}` : ""}${gateLine ? `\n${gateLine}` : ""}
 
 📋 Progress: ${hasProgress ? progressPath : "(none)"}
 📁 Artifacts: ${chainDir}`;
 	} else {
 		const stepInfo = failedStep ? ` at step ${failedStep.index + 1}` : "";
 		const errorInfo = failedStep?.error ? `: ${failedStep.error}` : "";
-		return `❌ Chain failed${stepInfo}${errorInfo}${skillsLine ? `\n${skillsLine}` : ""}
+		return `❌ Chain failed${stepInfo}${errorInfo}${skillsLine ? `\n${skillsLine}` : ""}${gateLine ? `\n${gateLine}` : ""}
 
 📋 Progress: ${hasProgress ? progressPath : "(none)"}
 📁 Artifacts: ${chainDir}`;

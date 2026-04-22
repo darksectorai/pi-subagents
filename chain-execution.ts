@@ -88,6 +88,8 @@ interface ParallelChainRunInput {
 	totalSteps: number;
 	worktreeSetup?: WorktreeSetup;
 	maxSubagentDepth: number;
+	qualityGate?: boolean;
+	qualityGateMaxRetries?: number;
 }
 
 function buildChainExecutionDetails(input: ChainExecutionDetailsInput): Details {
@@ -203,6 +205,8 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				availableModels: input.availableModels,
 				preferredModelProvider: input.ctx.model?.provider,
 				skills: behavior.skills === false ? [] : behavior.skills,
+				qualityGate: input.qualityGate,
+				qualityGateMaxRetries: input.qualityGateMaxRetries,
 				onUpdate: input.onUpdate
 					? (progressUpdate) => {
 							const stepResults = progressUpdate.details?.results || [];
@@ -254,6 +258,8 @@ export interface ChainExecutionParams {
 	maxSubagentDepth: number;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
+	qualityGate?: boolean;
+	qualityGateMaxRetries?: number;
 }
 
 export interface ChainExecutionResult {
@@ -486,6 +492,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					totalSteps,
 					worktreeSetup,
 					maxSubagentDepth: params.maxSubagentDepth,
+					qualityGate: params.qualityGate,
+					qualityGateMaxRetries: params.qualityGateMaxRetries,
 				});
 				globalTaskIndex += step.parallel.length;
 
@@ -620,6 +628,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				availableModels,
 				preferredModelProvider: ctx.model?.provider,
 				skills: behavior.skills === false ? [] : behavior.skills,
+				qualityGate: params.qualityGate,
+				qualityGateMaxRetries: params.qualityGateMaxRetries,
 				onUpdate: onUpdate
 					? (p) => {
 							const stepResults = p.details?.results || [];

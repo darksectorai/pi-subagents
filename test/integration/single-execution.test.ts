@@ -62,6 +62,12 @@ interface RunSyncResult {
 	detachedReason?: string;
 	savedOutputPath?: string;
 	outputSaveError?: string;
+	qualityGate?: {
+		passed: boolean;
+		exhausted?: boolean;
+		attempts: number;
+		runs: Array<{ phase: string; agent: string; pass?: boolean }>;
+	};
 }
 
 interface ExecutionModule {
@@ -191,6 +197,202 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 
 		assert.equal(result.exitCode, 1);
 		assert.ok(result.error?.includes("Something went wrong"));
+	});
+
+	it("runs quality gate validator and passes on validator artifact", async () => {
+		mockPi.onCall({ output: "producer output" });
+		mockPi.onCall({ output: JSON.stringify({ pass: true, reason: "ok" }) });
+		const agents = [
+			makeAgent("producer", {
+				qualityGate: {
+					validator: "validator",
+					validationOutput: "validation.json",
+					passField: "pass",
+					maxRetries: 1,
+					enabledByDefault: true,
+					onExhausted: "stop",
+				},
+			}),
+			makeAgent("validator"),
+		];
+
+		const result = await runSync(tempDir, agents, "producer", "Task", { runId: "gate-pass" });
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(mockPi.callCount(), 2);
+		assert.equal(result.qualityGate?.passed, true);
+		assert.equal(result.qualityGate?.runs.at(-1)?.pass, true);
+		assert.equal(fs.readFileSync(path.join(tempDir, "validation.json"), "utf-8"), JSON.stringify({ pass: true, reason: "ok" }));
+	});
+
+	it("can disable a configured quality gate for one run", async () => {
+		mockPi.onCall({ output: "producer output" });
+		const agents = [
+			makeAgent("producer", {
+				qualityGate: {
+					validator: "validator",
+					validationOutput: "validation.json",
+					passField: "pass",
+					maxRetries: 1,
+					enabledByDefault: true,
+					onExhausted: "stop",
+				},
+			}),
+			makeAgent("validator"),
+		];
+
+		const result = await runSync(tempDir, agents, "producer", "Task", {
+			runId: "gate-disabled",
+			qualityGate: false,
+		});
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(mockPi.callCount(), 1);
+		assert.equal(result.qualityGate, undefined);
+	});
+
+	it("can force a disabled-by-default quality gate for one run", async () => {
+		mockPi.onCall({ output: "producer output" });
+		mockPi.onCall({ output: JSON.stringify({ pass: true }) });
+		const agents = [
+			makeAgent("producer", {
+				qualityGate: {
+					validator: "validator",
+					validationOutput: "validation.json",
+					passField: "pass",
+					maxRetries: 1,
+					enabledByDefault: false,
+					onExhausted: "stop",
+				},
+			}),
+			makeAgent("validator"),
+		];
+
+		const result = await runSync(tempDir, agents, "producer", "Task", {
+			runId: "gate-forced",
+			qualityGate: true,
+		});
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(mockPi.callCount(), 2);
+		assert.equal(result.qualityGate?.passed, true);
+	});
+
+	it("honors qualityGateMaxRetries override", async () => {
+		mockPi.onCall({ output: "producer attempt 1" });
+		mockPi.onCall({ output: JSON.stringify({ pass: false, reason: "retry" }) });
+		mockPi.onCall({ output: "producer attempt 2" });
+		mockPi.onCall({ output: JSON.stringify({ pass: true }) });
+		const agents = [
+			makeAgent("producer", {
+				qualityGate: {
+					validator: "validator",
+					validationOutput: "validation.json",
+					passField: "pass",
+					maxRetries: 1,
+					enabledByDefault: true,
+					onExhausted: "stop",
+				},
+			}),
+			makeAgent("validator"),
+		];
+
+		const result = await runSync(tempDir, agents, "producer", "Task", {
+			runId: "gate-retry-override",
+			qualityGateMaxRetries: 2,
+		});
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(mockPi.callCount(), 4);
+		assert.equal(result.qualityGate?.attempts, 2);
+		assert.deepEqual(result.qualityGate?.runs.map((run) => `${run.phase}:${run.pass ?? "n/a"}`), [
+			"producer:n/a",
+			"validator:false",
+			"producer:n/a",
+			"validator:true",
+		]);
+	});
+
+	it("hard fails when validator artifact is malformed", async () => {
+		mockPi.onCall({ output: "producer output" });
+		mockPi.onCall({ output: "not json" });
+		const agents = [
+			makeAgent("producer", {
+				qualityGate: {
+					validator: "validator",
+					validationOutput: "validation.json",
+					passField: "pass",
+					maxRetries: 1,
+					enabledByDefault: true,
+					onExhausted: "stop",
+				},
+			}),
+			makeAgent("validator"),
+		];
+
+		const result = await runSync(tempDir, agents, "producer", "Task", { runId: "gate-malformed" });
+
+		assert.equal(result.exitCode, 1);
+		assert.match(result.error ?? "", /is not valid JSON/);
+		assert.equal(result.qualityGate?.passed, false);
+		assert.equal(result.qualityGate?.exhausted, undefined);
+	});
+
+	it("can continue after retry exhaustion when configured", async () => {
+		mockPi.onCall({ output: "producer output" });
+		mockPi.onCall({ output: JSON.stringify({ pass: false, reason: "accepted warning" }) });
+		const agents = [
+			makeAgent("producer", {
+				qualityGate: {
+					validator: "validator",
+					validationOutput: "validation.json",
+					passField: "pass",
+					maxRetries: 1,
+					enabledByDefault: true,
+					onExhausted: "continue",
+				},
+			}),
+			makeAgent("validator"),
+		];
+
+		const result = await runSync(tempDir, agents, "producer", "Task", { runId: "gate-continue" });
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.error, undefined);
+		assert.equal(result.qualityGate?.passed, false);
+		assert.equal(result.qualityGate?.exhausted, true);
+		assert.equal(result.qualityGate?.onExhausted, "continue");
+	});
+
+	it("runs quality gate fixer and fails clearly on exhaustion", async () => {
+		mockPi.onCall({ output: "producer output" });
+		mockPi.onCall({ output: JSON.stringify({ pass: false, reason: "bad" }) });
+		mockPi.onCall({ output: "fixed something" });
+		mockPi.onCall({ output: JSON.stringify({ pass: false, reason: "still bad" }) });
+		const agents = [
+			makeAgent("producer", {
+				qualityGate: {
+					validator: "validator",
+					fixer: "fixer",
+					validationOutput: "validation.json",
+					passField: "pass",
+					maxRetries: 1,
+					enabledByDefault: true,
+					onExhausted: "stop",
+				},
+			}),
+			makeAgent("validator"),
+			makeAgent("fixer"),
+		];
+
+		const result = await runSync(tempDir, agents, "producer", "Task", { runId: "gate-fail" });
+
+		assert.equal(result.exitCode, 1);
+		assert.equal(mockPi.callCount(), 4);
+		assert.equal(result.qualityGate?.passed, false);
+		assert.equal(result.qualityGate?.exhausted, true);
+		assert.match(result.error ?? "", /Quality gate exhausted/);
+		assert.deepEqual(result.qualityGate?.runs.map((run) => run.phase), ["producer", "validator", "fixer", "validator"]);
 	});
 
 	it("handles long tasks via temp file (ENAMETOOLONG prevention)", async () => {

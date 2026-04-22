@@ -345,6 +345,11 @@ export function formatAgentDetail(agent: AgentConfig): string {
 	if (agent.defaultReads?.length) lines.push(`Reads: ${agent.defaultReads.join(", ")}`);
 	if (agent.defaultProgress) lines.push("Progress: true");
 	if (agent.maxSubagentDepth !== undefined) lines.push(`Max subagent depth: ${agent.maxSubagentDepth}`);
+	if (agent.qualityGate) {
+		const gate = agent.qualityGate;
+		lines.push(`Quality gate: validator=${gate.validator}, fixer=${gate.fixer ?? "(none)"}, output=${gate.validationOutput}, maxRetries=${gate.maxRetries}`);
+		if (gate.validatorOutputSchema) lines.push(`Quality gate schema: ${gate.validatorOutputSchema}`);
+	}
 	if (agent.systemPrompt.trim()) lines.push("", "System Prompt:", agent.systemPrompt);
 	return lines.join("\n");
 }
