@@ -41,6 +41,48 @@ export interface TokenUsage {
 }
 
 // ============================================================================
+// Quality Gates
+// ============================================================================
+
+export type QualityGatePhase = "producer" | "validator" | "fixer";
+
+export interface QualityGateConfig {
+	validator: string;
+	fixer?: string;
+	validationOutput: string;
+	passField: string;
+	maxRetries: number;
+	enabledByDefault: boolean;
+	validatorOutputSchema?: string;
+	validatorOutputSchemaPath?: string;
+	onExhausted: "stop" | "continue";
+}
+
+export interface QualityGateRun {
+	phase: QualityGatePhase;
+	agent: string;
+	attempt: number;
+	exitCode: number;
+	pass?: boolean;
+	validationOutput?: string;
+	error?: string;
+}
+
+export interface QualityGateResult {
+	enabled: true;
+	passed: boolean;
+	exhausted?: boolean;
+	onExhausted?: "stop" | "continue";
+	attempts: number;
+	currentPhase?: QualityGatePhase;
+	validationOutput: string;
+	validatorOutputSchema?: string;
+	lastPass?: boolean;
+	error?: string;
+	runs: QualityGateRun[];
+}
+
+// ============================================================================
 // Progress Tracking
 // ============================================================================
 
@@ -109,6 +151,7 @@ export interface SingleResult {
 	finalOutput?: string;
 	savedOutputPath?: string;
 	outputSaveError?: string;
+	qualityGate?: QualityGateResult;
 }
 
 export interface Details {
@@ -178,6 +221,7 @@ export interface AsyncStatus {
 		attemptedModels?: string[];
 		modelAttempts?: ModelAttempt[];
 		error?: string;
+		qualityGate?: QualityGateResult;
 	}>;
 	sessionDir?: string;
 	outputFile?: string;
@@ -272,6 +316,10 @@ export interface RunSyncOptions {
 	preferredModelProvider?: string;
 	/** Skills to inject (overrides agent default if provided) */
 	skills?: string[];
+	/** Disable or force an agent quality gate for this run. */
+	qualityGate?: boolean;
+	/** Override qualityGate.maxRetries for this run. */
+	qualityGateMaxRetries?: number;
 }
 
 export type IntercomBridgeMode = "off" | "fork-only" | "always";

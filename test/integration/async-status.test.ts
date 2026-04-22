@@ -138,4 +138,40 @@ describe("async status helpers", () => {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	it("includes quality gate state in formatted step summaries", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-quality-gate-"));
+		try {
+			createAsyncDir(root, "run-gated", {
+				runId: "run-gated",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				lastUpdate: 200,
+				steps: [{
+					agent: "producer",
+					status: "running",
+					qualityGate: {
+						enabled: true,
+						passed: false,
+						attempts: 2,
+						currentPhase: "validator",
+						validationOutput: "/tmp/validation.json",
+						lastPass: false,
+						runs: [
+							{ phase: "producer", agent: "producer", attempt: 1, exitCode: 0 },
+							{ phase: "validator", agent: "validator", attempt: 1, exitCode: 0, pass: false },
+						],
+					},
+				}],
+			});
+
+			const runs = listAsyncRuns(root);
+			assert.equal(runs[0]?.steps[0]?.qualityGate?.attempts, 2);
+			const text = formatAsyncRunList(runs);
+			assert.match(text, /gate running \(2\)/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
 });

@@ -83,6 +83,15 @@ function buildDetailLines(
 	lines.push(renderFieldLine("Reads:", reads, contentWidth, theme));
 	lines.push(renderFieldLine("Progress:", progress, contentWidth, theme));
 	lines.push(renderFieldLine("Max depth:", maxSubagentDepth, contentWidth, theme));
+	if (agent.qualityGate) {
+		const gate = agent.qualityGate;
+		lines.push(renderFieldLine("Quality gate:", `${gate.validator} -> ${gate.fixer ?? "(no fixer)"}`, contentWidth, theme));
+		lines.push(renderFieldLine("Gate output:", gate.validationOutput, contentWidth, theme));
+		lines.push(renderFieldLine("Gate retries:", String(gate.maxRetries), contentWidth, theme));
+		if (gate.validatorOutputSchema) {
+			lines.push(renderFieldLine("Gate schema:", gate.validatorOutputSchema, contentWidth, theme));
+		}
+	}
 
 	if (agent.extraFields) {
 		for (const [key, value] of Object.entries(agent.extraFields)) {

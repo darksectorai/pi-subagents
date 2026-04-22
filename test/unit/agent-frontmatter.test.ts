@@ -169,6 +169,70 @@ Do work
 	});
 });
 
+describe("agent frontmatter qualityGate", () => {
+	it("serializes qualityGate into nested frontmatter", () => {
+		const agent: AgentConfig = {
+			name: "producer",
+			description: "Producer",
+			systemPrompt: "Do work",
+			systemPromptMode: "replace",
+			inheritProjectContext: false,
+			inheritSkills: false,
+			source: "project",
+			filePath: "/tmp/producer.md",
+			qualityGate: {
+				validator: "validator",
+				fixer: "fixer",
+				validationOutput: "validation.json",
+				passField: "pass",
+				maxRetries: 2,
+				enabledByDefault: true,
+				validatorOutputSchema: "validation.schema.json",
+				onExhausted: "stop",
+			},
+		};
+
+		const serialized = serializeAgent(agent);
+		assert.match(serialized, /qualityGate:\n  validator: validator\n  fixer: fixer\n  validationOutput: validation\.json\n  maxRetries: 2\n  validatorOutputSchema: validation\.schema\.json/);
+	});
+
+	it("parses qualityGate from discovered nested frontmatter", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-gate-frontmatter-"));
+		tempDirs.push(dir);
+		const agentsDir = path.join(dir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(path.join(agentsDir, "producer.md"), `---
+name: producer
+description: Producer
+qualityGate:
+  validator: validator
+  fixer: fixer
+  validationOutput: validation.json
+  passField: ok
+  maxRetries: 3
+  enabledByDefault: false
+  validatorOutputSchema: validation.schema.json
+  onExhausted: continue
+---
+
+Do work
+`, "utf-8");
+
+		const result = discoverAgents(dir, "project");
+		const producer = result.agents.find((agent) => agent.name === "producer");
+		assert.deepEqual(producer?.qualityGate, {
+			validator: "validator",
+			fixer: "fixer",
+			validationOutput: "validation.json",
+			passField: "ok",
+			maxRetries: 3,
+			enabledByDefault: false,
+			validatorOutputSchema: "validation.schema.json",
+			onExhausted: "continue",
+		});
+	});
+});
+
 describe("agent frontmatter prompt assembly defaults", () => {
 	it("defaults ordinary agents to replace mode with no inherited context or skills", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-default-prompt-settings-"));

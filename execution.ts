@@ -3,6 +3,7 @@
  */
 
 import { spawn } from "node:child_process";
+import * as fs from "node:fs";
 import type { Message } from "@mariozechner/pi-ai";
 import type { AgentConfig } from "./agents.ts";
 import {
@@ -15,6 +16,7 @@ import {
 	type AgentProgress,
 	type ArtifactPaths,
 	type ModelAttempt,
+	type ProgressSummary,
 	type RunSyncOptions,
 	type SingleResult,
 	type Usage,
@@ -42,6 +44,12 @@ import {
 	formatModelAttemptNote,
 	isRetryableModelFailure,
 } from "./model-fallback.ts";
+import {
+	compileQualityGate,
+	readValidatorArtifact,
+	resolveQualityGateOutputPath,
+	summarizeValidatorArtifact,
+} from "./quality-gate.ts";
 
 function emptyUsage(): Usage {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
@@ -454,9 +462,9 @@ async function runSingleAttempt(
 }
 
 /**
- * Run a subagent synchronously (blocking until complete)
+ * Run one subagent without applying qualityGate policy.
  */
-export async function runSync(
+async function runPlainSync(
 	runtimeCwd: string,
 	agents: AgentConfig[],
 	agentName: string,
@@ -617,4 +625,303 @@ export async function runSync(
 	}
 
 	return result;
+}
+
+function mergeUsage(results: SingleResult[]): Usage {
+	const usage = emptyUsage();
+	for (const result of results) sumUsage(usage, result.usage);
+	return usage;
+}
+
+function mergeProgressSummary(results: SingleResult[]): ProgressSummary {
+	const usage = mergeUsage(results);
+	return {
+		toolCount: results.reduce((sum, result) => sum + (result.progressSummary?.toolCount ?? 0), 0),
+		tokens: usage.input + usage.output,
+		durationMs: results.reduce((sum, result) => sum + (result.progressSummary?.durationMs ?? 0), 0),
+	};
+}
+
+function refreshOutputFromFile(result: SingleResult, outputPath: string | undefined): void {
+	if (!outputPath) return;
+	try {
+		if (!fs.existsSync(outputPath)) return;
+		result.finalOutput = fs.readFileSync(outputPath, "utf-8");
+		result.savedOutputPath = outputPath;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		result.outputSaveError = message;
+	}
+}
+
+function buildValidatorTask(input: {
+	agentName: string;
+	originalTask: string;
+	producerOutput: string;
+	validationOutputPath: string;
+	passField: string;
+	schemaPath?: string;
+	outputPath?: string;
+}): string {
+	return [
+		`Validate the output from agent '${input.agentName}'.`,
+		"",
+		"Original task:",
+		input.originalTask,
+		"",
+		"Producer output:",
+		input.producerOutput || "(no textual output)",
+		input.outputPath ? `Primary output file: ${input.outputPath}` : undefined,
+		"",
+		`Write a JSON object to: ${input.validationOutputPath}`,
+		`The JSON object must contain boolean field '${input.passField}'.`,
+		input.schemaPath ? `It must also conform to JSON Schema: ${input.schemaPath}` : undefined,
+		"Do not write markdown fences around the JSON artifact.",
+	].filter((line): line is string => line !== undefined).join("\n");
+}
+
+function buildFixerTask(input: {
+	agentName: string;
+	originalTask: string;
+	producerOutput: string;
+	validationOutputPath: string;
+	validationArtifact: string;
+	outputPath?: string;
+}): string {
+	return [
+		`Fix the output from agent '${input.agentName}' so it passes validation.`,
+		"",
+		"Original task:",
+		input.originalTask,
+		"",
+		"Current output:",
+		input.producerOutput || "(no textual output)",
+		"",
+		`Validator artifact: ${input.validationOutputPath}`,
+		input.validationArtifact || "(empty validator artifact)",
+		input.outputPath ? `Update the primary output file in place: ${input.outputPath}` : undefined,
+	].filter((line): line is string => line !== undefined).join("\n");
+}
+
+function buildRetryTask(originalTask: string, validationOutputPath: string, validationArtifact: string): string {
+	return [
+		originalTask,
+		"",
+		"Previous quality-gate validation did not pass. Produce a corrected result.",
+		`Validator artifact: ${validationOutputPath}`,
+		validationArtifact || "(empty validator artifact)",
+	].join("\n");
+}
+
+async function runQualityGatedSync(
+	runtimeCwd: string,
+	agents: AgentConfig[],
+	agent: AgentConfig,
+	task: string,
+	options: RunSyncOptions,
+): Promise<SingleResult> {
+	const executionCwd = options.cwd ?? runtimeCwd;
+	let compiled;
+	try {
+		compiled = compileQualityGate({
+			agent,
+			agents,
+			cwd: executionCwd,
+			runId: options.runId,
+			maxRetriesOverride: options.qualityGateMaxRetries,
+		});
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return {
+			agent: agent.name,
+			task,
+			exitCode: 1,
+			messages: [],
+			usage: emptyUsage(),
+			error: message,
+		};
+	}
+
+	const gate = compiled.config;
+	const runs: NonNullable<SingleResult["qualityGate"]>["runs"] = [];
+	const allResults: SingleResult[] = [];
+	let lastProducer: SingleResult | undefined;
+	let lastValidationRaw = "";
+	let lastPass = false;
+	let attempts = 0;
+
+	const gateOptions = (extra?: Partial<RunSyncOptions>): RunSyncOptions => ({
+		...options,
+		...extra,
+		qualityGate: false,
+		qualityGateMaxRetries: undefined,
+		onUpdate: undefined,
+		outputPath: extra?.outputPath,
+	});
+
+	const finish = (base: SingleResult, passed: boolean, error?: string, exhausted = false): SingleResult => {
+		refreshOutputFromFile(base, options.outputPath);
+		base.usage = mergeUsage(allResults);
+		base.progressSummary = mergeProgressSummary(allResults);
+		base.qualityGate = {
+			enabled: true,
+			passed,
+			exhausted: exhausted || undefined,
+			onExhausted: gate.onExhausted,
+			attempts,
+			currentPhase: runs.at(-1)?.phase,
+			validationOutput: compiled.validationOutputPath,
+			validatorOutputSchema: compiled.schemaPath,
+			lastPass,
+			error,
+			runs,
+		};
+		if (!passed && !(exhausted && gate.onExhausted === "continue")) {
+			base.exitCode = base.exitCode === 0 ? 1 : base.exitCode;
+			base.error = error ?? base.error ?? "Quality gate failed.";
+		}
+		return base;
+	};
+
+	if (gate.maxRetries === 0) {
+		const base: SingleResult = {
+			agent: agent.name,
+			task,
+			exitCode: gate.onExhausted === "continue" ? 0 : 1,
+			messages: [],
+			usage: emptyUsage(),
+			error: "Quality gate exhausted before running because maxRetries is 0.",
+		};
+		return finish(base, false, base.error, true);
+	}
+
+	for (let attempt = 1; attempt <= gate.maxRetries; attempt++) {
+		attempts = attempt;
+		const producerTask = lastValidationRaw
+			? buildRetryTask(task, compiled.validationOutputPath, summarizeValidatorArtifact(lastValidationRaw))
+			: task;
+		const producer = await runPlainSync(runtimeCwd, agents, agent.name, producerTask, gateOptions({ outputPath: options.outputPath }));
+		lastProducer = producer;
+		allResults.push(producer);
+		runs.push({ phase: "producer", agent: agent.name, attempt, exitCode: producer.exitCode, error: producer.error });
+		if (producer.exitCode !== 0) {
+			return finish(producer, false, producer.error || "Producer failed.");
+		}
+
+		const validatorOutputPath = resolveQualityGateOutputPath(gate.validationOutput, executionCwd, {
+			runId: options.runId,
+			agent: agent.name,
+			attempt,
+			phase: "validator",
+		});
+		const validatorTask = buildValidatorTask({
+			agentName: agent.name,
+			originalTask: task,
+			producerOutput: producer.finalOutput ?? "",
+			validationOutputPath: validatorOutputPath,
+			passField: gate.passField,
+			schemaPath: compiled.schemaPath,
+			outputPath: options.outputPath,
+		});
+		const validator = await runPlainSync(runtimeCwd, agents, gate.validator, validatorTask, gateOptions({ outputPath: validatorOutputPath }));
+		allResults.push(validator);
+		runs.push({ phase: "validator", agent: gate.validator, attempt, exitCode: validator.exitCode, validationOutput: validatorOutputPath, error: validator.error });
+		if (validator.exitCode !== 0) {
+			return finish(producer, false, validator.error || "Validator failed.");
+		}
+
+		let artifact;
+		try {
+			artifact = readValidatorArtifact(validatorOutputPath, gate.passField, compiled.validateSchema);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			runs[runs.length - 1]!.error = message;
+			return finish(producer, false, message);
+		}
+		lastValidationRaw = artifact.raw;
+		lastPass = artifact.pass;
+		runs[runs.length - 1]!.pass = artifact.pass;
+		if (artifact.pass) return finish(producer, true);
+
+		if (!gate.fixer) {
+			const message = "Quality gate did not pass and no fixer is configured.";
+			if (attempt === gate.maxRetries) return finish(producer, false, message, true);
+			continue;
+		}
+
+		const fixerTask = buildFixerTask({
+			agentName: agent.name,
+			originalTask: task,
+			producerOutput: producer.finalOutput ?? "",
+			validationOutputPath: validatorOutputPath,
+			validationArtifact: summarizeValidatorArtifact(artifact.raw),
+			outputPath: options.outputPath,
+		});
+		const fixer = await runPlainSync(runtimeCwd, agents, gate.fixer, fixerTask, gateOptions());
+		allResults.push(fixer);
+		runs.push({ phase: "fixer", agent: gate.fixer, attempt, exitCode: fixer.exitCode, error: fixer.error });
+		if (fixer.exitCode !== 0) {
+			return finish(producer, false, fixer.error || "Fixer failed.");
+		}
+		refreshOutputFromFile(producer, options.outputPath);
+
+		const postFixValidatorTask = buildValidatorTask({
+			agentName: agent.name,
+			originalTask: task,
+			producerOutput: producer.finalOutput ?? "",
+			validationOutputPath: validatorOutputPath,
+			passField: gate.passField,
+			schemaPath: compiled.schemaPath,
+			outputPath: options.outputPath,
+		});
+		const postFixValidator = await runPlainSync(runtimeCwd, agents, gate.validator, postFixValidatorTask, gateOptions({ outputPath: validatorOutputPath }));
+		allResults.push(postFixValidator);
+		runs.push({ phase: "validator", agent: gate.validator, attempt, exitCode: postFixValidator.exitCode, validationOutput: validatorOutputPath, error: postFixValidator.error });
+		if (postFixValidator.exitCode !== 0) {
+			return finish(producer, false, postFixValidator.error || "Validator failed after fixer.");
+		}
+		try {
+			artifact = readValidatorArtifact(validatorOutputPath, gate.passField, compiled.validateSchema);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			runs[runs.length - 1]!.error = message;
+			return finish(producer, false, message);
+		}
+		lastValidationRaw = artifact.raw;
+		lastPass = artifact.pass;
+		runs[runs.length - 1]!.pass = artifact.pass;
+		if (artifact.pass) return finish(producer, true);
+	}
+
+	const exhaustedMessage = `Quality gate exhausted after ${gate.maxRetries} attempt${gate.maxRetries === 1 ? "" : "s"}. Last ${gate.passField}=false.`;
+	const base = lastProducer ?? {
+		agent: agent.name,
+		task,
+		exitCode: 1,
+		messages: [],
+		usage: emptyUsage(),
+		error: exhaustedMessage,
+	};
+	return finish(base, false, exhaustedMessage, true);
+}
+
+/**
+ * Run a subagent synchronously (blocking until complete)
+ */
+export async function runSync(
+	runtimeCwd: string,
+	agents: AgentConfig[],
+	agentName: string,
+	task: string,
+	options: RunSyncOptions,
+): Promise<SingleResult> {
+	const agent = agents.find((a) => a.name === agentName);
+	if (!agent) {
+		return runPlainSync(runtimeCwd, agents, agentName, task, options);
+	}
+	const gateEnabled = options.qualityGate ?? agent.qualityGate?.enabledByDefault;
+	if (agent.qualityGate && gateEnabled !== false) {
+		return runQualityGatedSync(runtimeCwd, agents, agent, task, options);
+	}
+	return runPlainSync(runtimeCwd, agents, agentName, task, options);
 }

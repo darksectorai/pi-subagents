@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { formatDuration, formatTokens, shortenPath } from "./formatters.ts";
-import { type AsyncStatus, type TokenUsage } from "./types.ts";
+import { type AsyncStatus, type QualityGateResult, type TokenUsage } from "./types.ts";
 import { readStatus } from "./utils.ts";
 
 export interface AsyncRunStepSummary {
@@ -14,6 +14,7 @@ export interface AsyncRunStepSummary {
 	model?: string;
 	attemptedModels?: string[];
 	error?: string;
+	qualityGate?: QualityGateResult;
 }
 
 export interface AsyncRunSummary {
@@ -87,6 +88,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.model ? { model: step.model } : {}),
 			...(step.attemptedModels ? { attemptedModels: step.attemptedModels } : {}),
 			...(step.error ? { error: step.error } : {}),
+			...(step.qualityGate ? { qualityGate: step.qualityGate } : {}),
 		})),
 		...(status.sessionDir ? { sessionDir: status.sessionDir } : {}),
 		...(status.outputFile ? { outputFile: status.outputFile } : {}),
@@ -156,6 +158,10 @@ function formatStepLine(step: AsyncRunStepSummary): string {
 	if (step.model) parts.push(step.model);
 	if (step.durationMs !== undefined) parts.push(formatDuration(step.durationMs));
 	if (step.tokens) parts.push(`${formatTokens(step.tokens.total)} tok`);
+	if (step.qualityGate) {
+		const status = step.qualityGate.passed ? "gate passed" : step.qualityGate.exhausted ? "gate exhausted" : "gate running";
+		parts.push(`${status} (${step.qualityGate.attempts})`);
+	}
 	return parts.join(" | ");
 }
 

@@ -19,6 +19,15 @@ export const KNOWN_FIELDS = new Set([
 	"defaultProgress",
 	"interactive",
 	"maxSubagentDepth",
+	"qualityGate",
+	"qualityGate.validator",
+	"qualityGate.fixer",
+	"qualityGate.validationOutput",
+	"qualityGate.passField",
+	"qualityGate.maxRetries",
+	"qualityGate.enabledByDefault",
+	"qualityGate.validatorOutputSchema",
+	"qualityGate.onExhausted",
 ]);
 
 function joinComma(values: string[] | undefined): string | undefined {
@@ -64,6 +73,19 @@ export function serializeAgent(config: AgentConfig): string {
 	if (config.interactive) lines.push("interactive: true");
 	if (Number.isInteger(config.maxSubagentDepth) && config.maxSubagentDepth >= 0) {
 		lines.push(`maxSubagentDepth: ${config.maxSubagentDepth}`);
+	}
+	if (config.qualityGate) {
+		lines.push("qualityGate:");
+		lines.push(`  validator: ${config.qualityGate.validator}`);
+		if (config.qualityGate.fixer) lines.push(`  fixer: ${config.qualityGate.fixer}`);
+		lines.push(`  validationOutput: ${config.qualityGate.validationOutput}`);
+		if (config.qualityGate.passField !== "pass") lines.push(`  passField: ${config.qualityGate.passField}`);
+		lines.push(`  maxRetries: ${config.qualityGate.maxRetries}`);
+		if (!config.qualityGate.enabledByDefault) lines.push("  enabledByDefault: false");
+		if (config.qualityGate.validatorOutputSchema) {
+			lines.push(`  validatorOutputSchema: ${config.qualityGate.validatorOutputSchema}`);
+		}
+		if (config.qualityGate.onExhausted !== "stop") lines.push(`  onExhausted: ${config.qualityGate.onExhausted}`);
 	}
 
 	if (config.extraFields) {

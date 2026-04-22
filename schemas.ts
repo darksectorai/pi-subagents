@@ -100,6 +100,8 @@ export const SubagentParams = Type.Object({
 	output: Type.Optional(Type.Any({ description: "Output file for single agent (string), or false to disable. Relative paths resolve against cwd." })),
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Override model for single agent (e.g. 'anthropic/claude-sonnet-4')" })),
+	qualityGate: Type.Optional(Type.Boolean({ description: "Enable or disable agent qualityGate policy for this run." })),
+	qualityGateMaxRetries: Type.Optional(Type.Integer({ minimum: 0, description: "Override qualityGate.maxRetries for this run." })),
 });
 
 export const StatusParams = Type.Object({

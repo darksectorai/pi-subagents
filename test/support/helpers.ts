@@ -42,6 +42,17 @@ interface AgentConfig {
 	progress?: boolean;
 	mcpDirectTools?: string[];
 	maxSubagentDepth?: number;
+	qualityGate?: {
+		validator: string;
+		fixer?: string;
+		validationOutput: string;
+		passField: string;
+		maxRetries: number;
+		enabledByDefault: boolean;
+		validatorOutputSchema?: string;
+		validatorOutputSchemaPath?: string;
+		onExhausted: "stop" | "continue";
+	};
 }
 
 export function makeAgentConfigs(names: string[]): AgentConfig[] {

@@ -1,3 +1,5 @@
+import type { QualityGateConfig } from "./types.ts";
+
 export interface RunnerSubagentStep {
 	agent: string;
 	task: string;
@@ -15,6 +17,12 @@ export interface RunnerSubagentStep {
 	outputPath?: string;
 	sessionFile?: string;
 	maxSubagentDepth?: number;
+	qualityGate?: RunnerQualityGateConfig;
+}
+
+export interface RunnerQualityGateConfig extends QualityGateConfig {
+	validatorStep: Omit<RunnerSubagentStep, "task" | "qualityGate">;
+	fixerStep?: Omit<RunnerSubagentStep, "task" | "qualityGate">;
 }
 
 export interface ParallelStepGroup {
